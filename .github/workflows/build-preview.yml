@@ -1,0 +1,70 @@
+# Builds one preview site and publishes it (D-035). Started by the Bookcliff Portal's "Make a preview site"
+# button, or by hand from the Actions tab. Inputs reach the shell only through environment variables, never
+# pasted into a command, so a business name can't run code.
+name: Build a preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: Business name
+        required: true
+        type: string
+      town:
+        description: Town
+        required: false
+        default: Grand Junction
+        type: string
+      trade:
+        description: "Trade: cleaning, hauling, construction, salon, health, auto, landscaping, professional, general (blank to guess)"
+        required: false
+        default: ""
+        type: string
+      phone:
+        description: The phone number the business publishes (blank for a marked sample)
+        required: false
+        default: ""
+        type: string
+      request:
+        description: The portal's request ID
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: previews
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the preview
+        env:
+          NAME: ${{ inputs.name }}
+          TOWN: ${{ inputs.town }}
+          TRADE: ${{ inputs.trade }}
+          PHONE: ${{ inputs.phone }}
+          REQUEST: ${{ inputs.request }}
+        run: |
+          set -euo pipefail
+          args=(--name "$NAME" --town "${TOWN:-Grand Junction}" --out .)
+          if [ -n "$TRADE" ]; then args+=(--trade "$TRADE"); fi
+          if [ -n "$PHONE" ]; then args+=(--phone "$PHONE"); fi
+          if [ -n "$REQUEST" ]; then args+=(--request "$REQUEST"); fi
+          node tools/build-preview.js "${args[@]}"
+      - name: Publish
+        env:
+          NAME: ${{ inputs.name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Preview: $NAME"
+          git push
