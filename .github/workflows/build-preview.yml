@@ -30,6 +30,21 @@ on:
         required: false
         default: ""
         type: string
+      site:
+        description: Their website, Facebook or Instagram page (logo, photos, colors and details come from it; D-044)
+        required: false
+        default: ""
+        type: string
+      logo:
+        description: A link to their logo image
+        required: false
+        default: ""
+        type: string
+      photos:
+        description: Up to 6 links to their own photos, one per line
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -44,6 +59,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Install the builder's packages
+        run: if [ -f tools/package-lock.json ]; then npm ci --prefix tools --omit=dev --no-audit --no-fund; fi
       - name: Build the preview
         env:
           NAME: ${{ inputs.name }}
@@ -51,12 +68,21 @@ jobs:
           TRADE: ${{ inputs.trade }}
           PHONE: ${{ inputs.phone }}
           REQUEST: ${{ inputs.request }}
+          SITE: ${{ inputs.site }}
+          LOGO: ${{ inputs.logo }}
+          PHOTOS: ${{ inputs.photos }}
+          # Google Places API (New), for the business's Google listing details and photos. Optional:
+          # without it the builder uses their website and the links given (D-044).
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
         run: |
           set -euo pipefail
           args=(--name "$NAME" --town "${TOWN:-Grand Junction}" --out .)
           if [ -n "$TRADE" ]; then args+=(--trade "$TRADE"); fi
           if [ -n "$PHONE" ]; then args+=(--phone "$PHONE"); fi
           if [ -n "$REQUEST" ]; then args+=(--request "$REQUEST"); fi
+          if [ -n "$SITE" ]; then args+=(--site "$SITE"); fi
+          if [ -n "$LOGO" ]; then args+=(--logo "$LOGO"); fi
+          if [ -n "$PHOTOS" ]; then args+=(--photos "$PHOTOS"); fi
           node tools/build-preview.js "${args[@]}"
       - name: Publish
         env:
