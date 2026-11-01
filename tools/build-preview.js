@@ -1,141 +1,375 @@
-// Preview-site generator (D-035). Builds a one-page, phone-first mock website for a prospect so the
-// owners can show "this is what yours could look like" with a working form, tap-to-call and a booking
-// flow. Deterministic: no AI call, no network. Output is static HTML for the public previews repo.
+// Preview-site generator (D-035). Builds a one-page, phone-first website for a prospect so the owners
+// can show "this is what yours could look like", dressed in the business's own brand: its logo, photos,
+// colors and details, with a working sample form, tap-to-call and a booking flow. Deterministic: no AI
+// calls. Network sources are best-effort; when any of them fails, the page falls back to the trade
+// template look, and the build itself never fails because a source did.
 //
 // Usage:
 //   node ops/previews/build-preview.js --name "Naturally Spotless Cleaning LLC" --town Clifton \
-//        [--trade cleaning] [--phone "(970) 555-0100"] [--days 14] [--out ../bookcliff-previews]
+//        [--trade cleaning] [--phone "(970) 555-0100"] [--days 14] [--out ../bookcliff-previews] \
+//        [--lead-url https://...] [--request <portal id>] \
+//        [--site https://their-site.com | https://facebook.com/page | https://instagram.com/name] \
+//        [--logo https://.../logo.png] [--photos "url1,url2" (or one per line, at most 6)] \
+//        [--places-fixture saved-places.json]
+//   Env: GOOGLE_PLACES_API_KEY (optional), PREVIEW_LEAD_URL (default for --lead-url).
+//   Setup: `npm ci` in ops/previews installs sharp (pinned in package-lock.json). Without it the build
+//   still runs, minus the logo and image-derived colors.
+//
+// Sources, most trusted first (sources.js); an explicit flag always beats a discovered value:
+//   1. Google Places API (New), only when GOOGLE_PLACES_API_KEY is set (or --places-fixture, a saved
+//      { searchText, media } response pair for tests). Name, category, phone, hours, website, editorial
+//      summary and up to 6 photos. Photos are hotlinked by photoUri (Google's terms forbid storing them),
+//      with each author credited and a "Google Maps" attribution. Ratings and reviews are never requested.
+//      The street address is never shown. Google Maps and Search are never scraped.
+//   2. Their own website (--site, else Places websiteUri): one HTML fetch, robots.txt "Disallow: /"
+//      respected. Logo (schema.org logo, a logo <img>, apple-touch-icon, then og:image), photos (og:image
+//      and large content images, hotlinked), theme-color, meta description, phone, Facebook and Instagram
+//      links, and "family owned" only when the site says it. Facebook and Instagram URLs are never
+//      fetched, only linked ("Find us on Facebook").
+//   3. Owner-supplied --logo and --photos.
+//   The logo is downloaded, trimmed and re-encoded as <slug>/logo.png (SVGs are rasterized). Photos are
+//   never stored; the hero photo from their own site may be read into memory once to sample colors.
+//   Network limits (net.js): 8 s per request, HTML 2 MB, images 8 MB, content-type checks, http(s) only,
+//   no private addresses, and 45 s for all fetching together.
+//
+// Colors (colors.js): primary, accent and dark from the logo (SVG fill and stroke colors for SVGs), else
+// the site's theme-color, else their own hero photo, else the trade's palette (trades.js). Every text
+// and button pair is adjusted to WCAG 2.2 AA in both light and dark color schemes.
 //
 // What it writes into --out (default ./previews-out):
-//   <slug>-<code>/index.html   the preview (unguessable folder name)
+//   <slug>-<code>/index.html   the preview (unguessable folder name), plus logo.png when a logo was found
 //   previews.json              active previews: slug, business, built, expires (read by n8n's preview
 //                              reply to decide which business name it may use; expired ones are refused)
 //   robots.txt                 disallow everything
-// Rules it enforces: "Preview by Bookcliff Web" banner on every screen, noindex, no reviews, ratings,
-// photos, prices, licenses or claims, services labelled as samples, expiry date shown.
+// Stdout: one JSON line (slug, business, trade, town, expires, file, sources).
+//
+// Rules it enforces: "Preview by Bookcliff Web. Not <business>'s official site" banner on every screen
+// with the expiry date, noindex, services labelled as samples, no reviews, ratings, review counts,
+// prices, licenses, awards or claims (claim sentences are dropped from outside descriptions), the phone
+// is a marked sample unless given or found, everything from outside sources is escaped and only http(s)
+// URLs are used. The page ships no external JS and a hash-based Content-Security-Policy.
 
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
 const TRADES = require('./trades');
+const { createBudget, httpUrl, fetchCapped, attempt } = require('./net');
+const { readPlaces, readSite, socialFromUrl } = require('./sources');
+const { loadLogo, photoColorEntries } = require('./brand');
+const C = require('./colors');
 
 const args = process.argv.slice(2);
-const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
-const rawName = opt('--name');
-if (!rawName) { console.error('Usage: --name "Business LLC" --town Town [--trade key] [--phone ...] [--days 14] [--out dir]'); process.exit(1); }
-const town = opt('--town', 'Grand Junction');
-const phone = opt('--phone', '');
-const days = parseInt(opt('--days', '14'), 10) || 14;
-const outDir = path.resolve(opt('--out', 'previews-out'));
-// The live lead-reply endpoint for previews; empty until the n8n preview reply is deployed (OQ-050).
-const LEAD_URL = opt('--lead-url', process.env.PREVIEW_LEAD_URL || '');
+const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 && args[i + 1] !== undefined ? args[i + 1] : d; };
+
 const BOOKCLIFF_CAL = 'https://cal.com/cloudburstt/15min';
+const FETCH_BUDGET_MS = 45000;
 
-const name = rawName.replace(/,?\s*\b(L\.?L\.?C|Inc\.?|Incorporated|Corp\.?|Co\.)\s*$/i, '').replace(/\s+/g, ' ').trim();
-const tradeKey = opt('--trade') || Object.keys(TRADES).find((k) => k !== 'general' && TRADES[k].match.test(rawName)) || 'general';
-const T = TRADES[tradeKey];
-if (!T) { console.error(`Unknown trade "${tradeKey}". Use one of: ${Object.keys(TRADES).join(', ')}`); process.exit(1); }
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const findTrade = (text) => Object.keys(TRADES).find((k) => k !== 'general' && TRADES[k].match.test(String(text || '')));
+const telHref = (phone) => { const d = phone.replace(/[^\d+]/g, ''); return `tel:${d.startsWith('+') ? d : '+1' + d}`; };
 
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const slugBase = name.toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-const code = crypto.randomBytes(3).toString('hex');
-const slug = `${slugBase}-${code}`;
-const today = new Date();
-const expires = new Date(today.getTime() + days * 86400000).toISOString().slice(0, 10);
-const built = today.toISOString().slice(0, 10);
-const tel = phone.replace(/[^\d+]/g, '');
-const phoneHtml = phone
-  ? `<a class="btn btn-ghost" href="tel:${esc(tel.startsWith('+') ? tel : '+1' + tel)}">Call ${esc(phone)}</a>`
-  : `<span class="btn btn-ghost is-sample" title="Your number goes here">Call (970) 000-0000 <small>sample</small></span>`;
-const initials = name.split(/\s+/).filter((w) => /^[A-Za-z]/.test(w)).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
+// Squarespace's image CDN resizes by query string, so their photos get a srcset instead of 2 MB originals.
+function responsive(url, widths) {
+  const u = new URL(url);
+  if (/(^|\.)squarespace-cdn\.com$|(^|\.)squarespace\.com$/.test(u.hostname)) {
+    const at = (w) => { const v = new URL(u.href); v.searchParams.set('format', `${w}w`); return v.href; };
+    return { src: at(widths[widths.length - 1]), srcset: widths.map((w) => `${at(w)} ${w}w`).join(', ') };
+  }
+  return { src: u.href, srcset: '' };
+}
 
-const services = T.services.map(([h, p]) => `<li><h3>${esc(h)}</h3><p>${esc(p)}</p></li>`).join('');
-const options = T.services.map(([h]) => `<option>${esc(h)}</option>`).join('');
-const steps = T.steps.map((s, i) => `<li><span>${i + 1}</span>${esc(s)}</li>`).join('');
+const ICON = {
+  phone: '<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.9.6 2.8.7a2 2 0 0 1 1.7 2z"/>',
+  pin: '<path d="M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9v12h14V9"/><path d="M10 21v-6h4v6"/>',
+  facebook: '<path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>',
+  instagram: '<rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><path d="M17.5 6.5h.01"/>',
+  arrow: '<path d="M5 12h14"/><path d="m13 6 6 6-6 6"/>',
+  check: '<path d="m5 12 5 5L20 7"/>',
+};
+const icon = (n, cls = 'ic') => `<svg class="${cls}" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">${ICON[n]}</svg>`;
 
-const html = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex, nofollow, noarchive">
-<title>${esc(name)} (preview by Bookcliff Web)</title>
-<meta name="description" content="A preview website built by Bookcliff Web for ${esc(name)}. Not the official site.">
-<style>
-:root{--a:${T.accent};--ad:${T.accentDark};--tint:${T.tint};--ink:#18212b;--muted:#5b6672;--line:#e3e7ec;--bg:#fff}
-*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:var(--bg);line-height:1.55}
-a{color:var(--ad)}.wrap{max-width:1080px;margin:0 auto;padding:0 20px}
-.pv{position:sticky;top:0;z-index:20;background:#14202E;color:#fff;font-size:13px;padding:8px 0}
-.pv .wrap{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}.pv b{color:#E8833A}.pv a{color:#fff}
-header.top{border-bottom:1px solid var(--line);background:#fff}header.top .wrap{display:flex;align-items:center;justify-content:space-between;height:68px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--ink);text-decoration:none}
-.mark{width:38px;height:38px;border-radius:10px;background:var(--a);color:#fff;display:grid;place-items:center;font-size:15px;letter-spacing:.5px}
-nav a{margin-left:18px;color:var(--muted);text-decoration:none;font-size:15px}nav a:hover{color:var(--ink)}
-.hero{background:linear-gradient(160deg,var(--tint),#fff 70%);padding:64px 0 56px}
-.hero h1{font-size:clamp(30px,5vw,48px);line-height:1.1;margin:0 0 14px;max-width:16ch}.hero p{font-size:18px;color:var(--muted);max-width:52ch;margin:0 0 26px}
-.btns{display:flex;gap:12px;flex-wrap:wrap}.btn{display:inline-flex;align-items:center;gap:8px;padding:14px 20px;border-radius:12px;font-weight:700;text-decoration:none;border:2px solid var(--a);cursor:pointer;font-size:16px}
-.btn-main{background:var(--a);color:#fff}.btn-main:hover{background:var(--ad);border-color:var(--ad)}.btn-ghost{background:#fff;color:var(--ad)}
-.is-sample small,.tag{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;background:#fff3e6;color:#9a4a0c;border-radius:6px;padding:2px 6px}
-.chips{display:flex;gap:18px;flex-wrap:wrap;margin-top:28px;color:var(--muted);font-size:14px}.chips span::before{content:"✓ ";color:var(--a);font-weight:800}
-section{padding:60px 0}h2{font-size:clamp(24px,3.4vw,32px);margin:0 0 8px}.lead{color:var(--muted);margin:0 0 28px}
-.svc{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}
-.svc li{border:1px solid var(--line);border-radius:14px;padding:20px;background:#fff}.svc h3{margin:0 0 6px;font-size:18px}.svc p{margin:0;color:var(--muted);font-size:15px}
-.band{background:var(--tint)}.steps{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
-.steps li{background:#fff;border-radius:14px;padding:20px;font-weight:700;display:flex;gap:12px;align-items:center}.steps span{flex:none;width:34px;height:34px;border-radius:50%;background:var(--a);color:#fff;display:grid;place-items:center}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:28px}@media(max-width:760px){.grid2{grid-template-columns:1fr}nav{display:none}}
-.card{border:1px solid var(--line);border-radius:16px;padding:24px;background:#fff}
-.empty{border:2px dashed var(--line);border-radius:14px;padding:22px;color:var(--muted);text-align:center}
-form label{display:block;font-weight:600;font-size:14px;margin:12px 0 6px}form input,form select,form textarea{width:100%;padding:12px;border:1px solid #cfd6dd;border-radius:10px;font:inherit}
-form button{margin-top:16px;width:100%}.hp{position:absolute;left:-9999px}.fine{font-size:12px;color:var(--muted);margin-top:10px}
-.ok{display:none;text-align:center;padding:30px 10px}.ok.show{display:block}.ok h3{margin:0 0 8px;font-size:22px}
-.slots{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0}.slots button{padding:10px;border:1px solid #cfd6dd;border-radius:10px;background:#fff;font:inherit;cursor:pointer}
-.slots button[aria-pressed=true]{background:var(--a);color:#fff;border-color:var(--a)}
-footer{border-top:1px solid var(--line);padding:28px 0;color:var(--muted);font-size:14px}
-.callbar{position:fixed;left:0;right:0;bottom:0;display:none;gap:8px;padding:10px;background:#fff;border-top:1px solid var(--line);z-index:15}.callbar .btn{flex:1;justify-content:center;padding:12px}
-@media(max-width:760px){.callbar{display:flex}body{padding-bottom:70px}}
-</style>
-</head>
-<body>
-<div class="pv" role="note"><div class="wrap"><span><b>Preview</b> by Bookcliff Web. Not ${esc(name)}'s official site.</span><span>Hidden from Google · expires ${expires} · <a href="https://bookcliffweb.com" rel="noopener">bookcliffweb.com</a></span></div></div>
-<header class="top"><div class="wrap"><a class="brand" href="#top"><span class="mark" aria-hidden="true">${esc(initials)}</span>${esc(name)}</a>
-<nav aria-label="Main"><a href="#services">Services</a><a href="#how">How it works</a><a href="#book">Book</a><a href="#contact">Contact</a></nav></div></header>
-<main id="top">
-<section class="hero"><div class="wrap">
-<h1>${esc(T.headline(name, town))}</h1><p>${esc(T.sub)}</p>
-<div class="btns"><a class="btn btn-main" href="#contact">${esc(T.cta)}</a>${phoneHtml}</div>
-<div class="chips"><span>Locally owned in ${esc(town)}</span><span>Fast replies</span><span>Easy online booking</span></div>
-</div></section>
-<section id="services"><div class="wrap"><h2>Services <span class="tag">sample</span></h2><p class="lead">Typical ${esc(T.noun)} services. On the real site, these are ${esc(name)}'s own, in their own words.</p><ul class="svc">${services}</ul></div></section>
-<section id="how" class="band"><div class="wrap"><h2>How it works</h2><p class="lead">Three simple steps.</p><ol class="steps">${steps}</ol></div></section>
-<section id="reviews"><div class="wrap grid2">
-<div><h2>What customers say</h2><p class="lead">Real Google reviews show here once customers leave them. A simple request after each job is how most local businesses get their first 20.</p></div>
-<div class="empty">Your Google reviews will appear here.<br><small>We never write or invent reviews.</small></div>
-</div></section>
-<section id="book" class="band"><div class="wrap grid2">
-<div><h2>Book online</h2><p class="lead">Customers pick a time without a phone call. It lands on your calendar with a reminder for them.</p></div>
-<div class="card" id="bookcard"><strong>Pick a time</strong> <span class="tag">demo</span><div class="slots" role="group" aria-label="Sample times">
-<button type="button">Mon 9:00</button><button type="button">Mon 1:00</button><button type="button">Tue 10:30</button><button type="button">Wed 8:00</button><button type="button">Thu 2:00</button><button type="button">Fri 11:00</button></div>
-<button class="btn btn-main" id="bookbtn" type="button" style="width:100%">Confirm time</button><p class="fine" id="bookmsg" role="status"></p></div>
-</div></section>
-<section id="contact"><div class="wrap grid2">
-<div><h2>${esc(T.cta)}</h2><p class="lead">Send a message and get a personal reply by email within a minute, any time of day.</p>
-<p class="fine">Try it with your own email address: that's the reply your customers would get.</p></div>
-<div class="card"><form id="lead" novalidate>
-<label for="f-name">Your name</label><input id="f-name" name="name" autocomplete="name" required>
-<label for="f-email">Email</label><input id="f-email" name="email" type="email" autocomplete="email" required>
-<label for="f-phone">Phone (optional)</label><input id="f-phone" name="phone" type="tel" autocomplete="tel">
-<label for="f-service">What do you need?</label><select id="f-service" name="service">${options}<option>Something else</option></select>
-<label for="f-msg">Details</label><textarea id="f-msg" name="message" rows="4"></textarea>
-<input class="hp" tabindex="-1" autocomplete="off" name="_gotcha" aria-hidden="true">
-<button class="btn btn-main" type="submit">Send</button>
-<p class="fine">Preview form: your email gets one sample reply from Bookcliff Web and is not saved to any list.</p>
-</form><div class="ok" id="ok" tabindex="-1" role="status"><h3>Thanks<span id="okname"></span>!</h3><p id="okmsg"></p><button class="btn btn-ghost" id="again" type="button">Send another</button></div></div>
-</div></section>
-</main>
-<footer><div class="wrap">${esc(name)} · ${esc(town)}, Colorado · preview built ${built} by <a href="https://bookcliffweb.com" rel="noopener">Bookcliff Web</a>. Want this site for real? <a href="${BOOKCLIFF_CAL}" rel="noopener">Book a free 15-minute call</a>.</div></footer>
-<div class="callbar">${phone ? `<a class="btn btn-ghost" href="tel:${esc(tel.startsWith('+') ? tel : '+1' + tel)}">Call</a>` : '<span class="btn btn-ghost is-sample">Call</span>'}<a class="btn btn-main" href="#contact">Message us</a></div>
-<script>
-(()=>{const LEAD=${JSON.stringify(LEAD_URL)},SLUG=${JSON.stringify(slug)};
+async function validatePhoto(p, budget) {
+  // Hotlinked photos must be live images; an http URL is upgraded to https or dropped (mixed content).
+  const u = httpUrl(p.url);
+  if (!u) return null;
+  if (u.protocol === 'http:') u.protocol = 'https:';
+  const res = await fetchCapped(u.href, { budget, headersOnly: true, maxBytes: 8 * 1024 * 1024, accept: /^image\/(jpeg|png|webp|avif|gif)/ });
+  return { ...p, url: res.url };
+}
+
+async function main() {
+  const rawName = opt('--name');
+  if (!rawName) { console.error('Usage: --name "Business LLC" --town Town [--trade key] [--phone ...] [--days 14] [--out dir] [--site url] [--logo url] [--photos urls] [--places-fixture file]'); process.exit(1); }
+  const town = opt('--town', 'Grand Junction');
+  const phoneArg = opt('--phone', '');
+  const days = parseInt(opt('--days', '14'), 10) || 14;
+  const outDir = path.resolve(opt('--out', 'previews-out'));
+  // The live lead-reply endpoint for previews; empty until the n8n preview reply is deployed (OQ-050).
+  const leadUrl = httpUrl(opt('--lead-url', process.env.PREVIEW_LEAD_URL || ''));
+  const LEAD_URL = leadUrl && leadUrl.protocol === 'https:' ? leadUrl.href : '';
+  const tradeFlag = opt('--trade');
+  if (tradeFlag && !TRADES[tradeFlag]) { console.error(`Unknown trade "${tradeFlag}". Use one of: ${Object.keys(TRADES).join(', ')}`); process.exit(1); }
+
+  const name = rawName.replace(/,?\s*\b(L\.?L\.?C|Inc\.?|Incorporated|Corp\.?|Co\.)\s*$/i, '').replace(/\s+/g, ' ').trim();
+  const slugBase = name.toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+  const code = crypto.randomBytes(3).toString('hex');
+  const slug = `${slugBase}-${code}`;
+  const today = new Date();
+  const expires = new Date(today.getTime() + days * 86400000).toISOString().slice(0, 10);
+  const built = today.toISOString().slice(0, 10);
+
+  // ---------- gather (best-effort, bounded) ----------
+  const budget = createBudget(FETCH_BUDGET_MS);
+  const key = process.env.GOOGLE_PLACES_API_KEY || '';
+  const fixture = opt('--places-fixture', '');
+  const places = key || fixture ? await attempt('Google Places', () => readPlaces({ name: rawName, town, key, fixturePath: fixture, budget })) : null;
+  if (places?.status && places.status !== 'OPERATIONAL') console.error(`[preview] Google Places says this business is ${places.status}`);
+  // Google's Places terms let us keep only the place ID: its hours, phone, summary and photos can't be baked into a
+  // saved page, even for 14 days (HQ D-044). So Places only finds their website and trade, and links to the listing.
+  if (places) Object.assign(places, { photos: [], phone: '', hours: [], summary: '' });
+
+  const siteArg = opt('--site', '') || places?.website || '';
+  const socials = {};
+  let site = null;
+  const socialSite = socialFromUrl(siteArg);
+  if (socialSite) socials[socialSite.kind] = socialSite.url;
+  else if (siteArg) site = await attempt('website', () => readSite(siteArg, { budget, businessName: name }));
+  for (const [k, v] of Object.entries(site?.socials || {})) if (!socials[k]) socials[k] = v;
+
+  const logoCandidates = [];
+  const ownerLogo = httpUrl(opt('--logo', ''));
+  if (ownerLogo) logoCandidates.push({ url: ownerLogo.href, from: '--logo' });
+  for (const c of site?.logos || []) if (!logoCandidates.some((x) => x.url === c.url)) logoCandidates.push(c);
+  let logo = null;
+  for (const c of logoCandidates.slice(0, 5)) {
+    logo = await attempt(`logo from ${c.from}`, () => loadLogo(c.url, { budget, rejectPhotos: Boolean(c.rejectPhotos) }));
+    if (logo) { logo.from = c.from; break; }
+  }
+
+  const photosArg = String(opt('--photos', ''));
+  const ownerPhotos = photosArg.split(/\r?\n/).flatMap((line) => line.split(/,\s*(?=[a-z][a-z0-9+.-]*:)/i))
+    .map((s) => s.trim()).filter(Boolean).slice(0, 6).map((url) => ({ url, width: 0, height: 0, alt: '', source: 'owner' }));
+  const toCheck = [...ownerPhotos, ...(site?.photos || []).map((p) => ({ ...p, source: 'site' }))].slice(0, 12);
+  const checked = await Promise.all(toCheck.map((p) => attempt(`photo from ${p.source}`, () => validatePhoto(p, budget))));
+  const seenPhoto = new Set();
+  const photos = [...checked.filter((p) => p && p.source === 'owner'), ...(places?.photos || []), ...checked.filter((p) => p && p.source === 'site')]
+    .filter((p) => { const k = p.url.split('?')[0]; if (seenPhoto.has(k) || (logo && logo.url.split('?')[0] === k)) return false; seenPhoto.add(k); return true; })
+    .slice(0, 6);
+  const heroIndex = Math.max(0, photos.findIndex((p) => !p.width || (p.width >= 800 && p.width / p.height >= 1.15 && p.width / p.height <= 2.4)));
+  const hero = photos.length ? photos[heroIndex] : null;
+  const rest = photos.filter((p) => p !== hero);
+
+  // ---------- trade, facts, palette ----------
+  const tradeKey = tradeFlag || findTrade(rawName) || [places?.category, ...(site?.tradeHints || [])].map(findTrade).find(Boolean) || 'general';
+  const T = TRADES[tradeKey];
+  const phone = phoneArg || places?.phone || site?.phone || '';
+  const description = places?.summary || site?.description || '';
+  const descriptionFrom = places?.summary ? 'google' : site?.description ? 'site' : '';
+  const hours = places && places.status !== 'CLOSED_PERMANENTLY' ? places.hours : [];
+  const category = T.label || ''; // never Google's category text on the page (see above)
+
+  let palette = null, paletteFrom = 'trade';
+  if (logo) {
+    const p = C.pickPalette(logo.entries, logo.mode);
+    if (p.primary) { palette = p; paletteFrom = 'logo'; }
+  }
+  const theme = site?.themeColor;
+  if (!palette && theme && C.chroma(theme) >= 0.12 && C.toHsl(theme).l > 0.08 && C.toHsl(theme).l < 0.92) { palette = { primary: theme, accent: null, dark: null }; paletteFrom = 'theme-color'; }
+  if (!palette && hero && hero.source !== 'google') {
+    const entries = await attempt('photo colors', () => photoColorEntries(hero.url, { budget }));
+    const p = entries ? C.pickPalette(entries, 'photo') : null;
+    if (p?.primary) { palette = p; paletteFrom = 'photo'; }
+  }
+  if (!palette) palette = { primary: C.parseColor(T.accent), accent: null, dark: C.parseColor(T.accentDark) };
+  let tokens = C.buildTokens(palette);
+  const failing = C.contrastPairs(tokens).filter((x) => x.ratio < x.min);
+  if (failing.length) {
+    console.error(`[preview] palette from ${paletteFrom} missed AA on ${failing.map((f) => f.name).join(', ')}; using the trade palette`);
+    tokens = C.buildTokens({ primary: C.parseColor(T.accent), accent: null, dark: C.parseColor(T.accentDark) });
+    paletteFrom = 'trade';
+  }
+
+  // ---------- markup pieces ----------
+  const initials = name.split(/\s+/).filter((w) => /^[A-Za-z0-9]/.test(w)).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
+  const wordmark = logo && logo.width / logo.height >= 2.2;
+  const logoClass = logo ? `logo-${logo.tone}` : 'logo-none';
+  const brandHtml = logo
+    ? `<img class="logo" src="logo.png" width="${logo.width}" height="${logo.height}" alt="${wordmark ? esc(name) : ''}">${wordmark ? '' : `<span class="brand-name">${esc(name)}</span>`}`
+    : `<span class="mark" aria-hidden="true">${esc(initials)}</span><span class="brand-name">${esc(name)}</span>`;
+  const callSmall = phone
+    ? `<a class="btn btn-main btn-sm" href="${esc(telHref(phone))}">${icon('phone')}<span>Call</span></a>`
+    : `<span class="btn btn-main btn-sm is-sample" title="Your number goes here">${icon('phone')}<span>Call</span> <small>sample</small></span>`;
+  const callHero = phone
+    ? `<a class="btn btn-onphoto" href="${esc(telHref(phone))}">${icon('phone')}Call ${esc(phone)}</a>`
+    : `<span class="btn btn-onphoto is-sample" title="Your number goes here">${icon('phone')}Call (970) 000-0000 <small>sample</small></span>`;
+
+  const googleMark = '<span class="gmaps">Google Maps</span>';
+  const credit = (p) => p.source === 'google' && p.authors?.length
+    ? `Photo: ${p.authors.map((a) => (a.uri ? `<a href="${esc(a.uri)}" rel="noopener nofollow">${esc(a.name)}</a>` : esc(a.name))).join(', ')}`
+    : '';
+  const altFor = (p, i) => p.alt || (p.source === 'google' ? `Photo of ${name} on Google Maps` : p.source === 'site' ? `Photo ${i + 1} from ${name}'s website` : `Photo of ${name}`);
+  const img = (p, i, { sizes, lazy }) => {
+    const r = responsive(p.url, lazy ? [500, 750, 1000] : [750, 1000, 1500]);
+    const [w, h] = p.width && p.height ? [p.width, p.height] : [1200, 900];
+    return `<img src="${esc(r.src)}"${r.srcset ? ` srcset="${esc(r.srcset)}" sizes="${sizes}"` : ''} width="${w}" height="${h}" alt="${esc(altFor(p, i))}" referrerpolicy="no-referrer" data-ext ${lazy ? 'loading="lazy" decoding="async"' : 'fetchpriority="high"'}>`;
+  };
+
+  const heroLine = (() => {
+    const first = (description.match(/^.{20,180}?[.!?](\s|$)/) || [])[0];
+    return first ? first.trim() : T.sub;
+  })();
+
+  const trust = [];
+  trust.push(`<li>${icon('pin')}<span><strong>${esc(town)}, CO</strong><small>${places?.serviceArea || !['food', 'salon', 'auto', 'health'].includes(tradeKey) ? 'Service area' : 'Location'}</small></span></li>`);
+  if (hours.length) {
+    const open = hours.filter((h) => !/closed/i.test(h)).length;
+    trust.push(`<li>${icon('clock')}<span><strong><a href="#hours">${open === 7 ? 'Open 7 days' : `Open ${open} day${open === 1 ? '' : 's'} a week`}</a></strong><small>Hours</small></span></li>`);
+  }
+  if (phone) trust.push(`<li>${icon('phone')}<span><strong><a href="${esc(telHref(phone))}">${esc(phone)}</a></strong><small>Call</small></span></li>`);
+  if (site?.familyOwned) trust.push(`<li>${icon('home')}<span><strong>Family owned</strong><small>Local business</small></span></li>`);
+  const trustHtml = trust.length >= 2 ? `<div class="wrap"><ul class="trust" aria-label="At a glance">${trust.join('')}</ul></div>` : '';
+
+  const services = T.services.map(([h, p], i) => `<li><span class="num" aria-hidden="true">${String(i + 1).padStart(2, '0')}</span><h3>${esc(h)}</h3><p>${esc(p)}</p></li>`).join('');
+  const options = T.services.map(([h]) => `<option>${esc(h)}</option>`).join('');
+  const steps = T.steps.map((s, i) => `<li><span aria-hidden="true">${i + 1}</span>${esc(s)}</li>`).join('');
+
+  const gallery = rest.length >= 2 ? rest : [];
+  const aboutPhoto = rest.length === 1 ? rest[0] : null;
+  const fig = (p, i, sizes) => {
+    const c = credit(p);
+    return `<li data-photo><figure>${img(p, i + 1, { sizes, lazy: true })}${c ? `<figcaption>${c}</figcaption>` : ''}</figure></li>`;
+  };
+  const sources = new Set(gallery.map((p) => p.source));
+  const galleryNote = sources.size === 1 && sources.has('google')
+    ? `Photos from ${esc(name)}'s Google Business Profile, shown from ${googleMark}.`
+    : sources.size === 1 && sources.has('site') ? `Photos from ${esc(name)}'s own website.` : `Photos of ${esc(name)}.`;
+  const galleryHtml = gallery.length ? `
+<section id="photos" class="sec sec-tint" aria-labelledby="photos-h"><div class="wrap">
+<div class="sec-head"><p class="kicker">Photos</p><h2 id="photos-h">A look at ${esc(name)}</h2><p class="lead">${galleryNote}</p></div>
+<ul class="gallery">${gallery.map((p, i) => fig(p, i, '(min-width: 760px) 34vw, 50vw')).join('')}</ul>
+${places?.mapsUri && sources.has('google') ? `<p class="fine"><a href="${esc(places.mapsUri)}" rel="noopener">See every photo on Google Maps</a></p>` : ''}
+</div></section>` : '';
+
+  const socialHtml = Object.entries(socials).map(([k, u]) => `<a class="social" href="${esc(u)}" rel="noopener">${icon(k)}Find us on ${k === 'facebook' ? 'Facebook' : 'Instagram'}</a>`).join('');
+  const siteHost = site ? new URL(site.url).hostname.replace(/^www\./, '') : '';
+  const aboutText = description
+    ? `<p class="about-text">${esc(description)}</p><p class="src">${descriptionFrom === 'google' ? `Summary from ${googleMark}` : `In their words, from ${esc(siteHost)}`}</p>`
+    : `<p class="about-text">This is where ${esc(name)}'s story goes: how it started, who does the work and what makes it different. <span class="tag">sample</span></p>`;
+  const aboutHtml = `
+<section id="about" class="sec" aria-labelledby="about-h"><div class="wrap about${aboutPhoto ? ' has-photo' : ''}">
+<div><p class="kicker">About</p><h2 id="about-h">About ${esc(name)}</h2>${aboutText}${socialHtml ? `<div class="socials">${socialHtml}</div>` : ''}</div>
+${aboutPhoto ? `<figure class="about-photo" data-photo>${img(aboutPhoto, 1, { sizes: '(min-width: 760px) 45vw, 100vw', lazy: true })}${credit(aboutPhoto) ? `<figcaption>${credit(aboutPhoto)}</figcaption>` : ''}</figure>` : ''}
+</div></section>`;
+
+  const hoursHtml = hours.length ? `
+<section id="hours" class="sec sec-tint" aria-labelledby="hours-h"><div class="wrap grid2">
+<div><p class="kicker">Visit</p><h2 id="hours-h">Hours</h2><p class="lead">${esc(town)}, Colorado${phone ? ` · <a href="${esc(telHref(phone))}">${esc(phone)}</a>` : ''}</p>
+<p class="fine">Details from ${googleMark}.${places.mapsUri ? ` <a href="${esc(places.mapsUri)}" rel="noopener">View on Google Maps</a>` : ''}</p></div>
+<div class="card"><table class="hours"><caption class="sr">Opening hours</caption><tbody>${hours.map((h) => { const i = h.indexOf(':'); return i > 0 ? `<tr><th scope="row">${esc(h.slice(0, i))}</th><td>${esc(h.slice(i + 1).trim())}</td></tr>` : `<tr><td colspan="2">${esc(h)}</td></tr>`; }).join('')}</tbody></table></div>
+</div></section>` : '';
+
+  const heroHtml = `<section class="hero${hero ? ' has-photo' : ''}" aria-labelledby="h1">
+${hero ? `<div class="hero-media">${img(hero, 0, { sizes: '100vw', lazy: false })}</div>` : ''}
+<div class="wrap hero-inner">
+<p class="eyebrow">${category ? `${esc(category)} · ` : ''}${esc(town)}, Colorado</p>
+<h1 id="h1">${esc(name)}</h1>
+<p class="hero-sub">${esc(heroLine)}</p>
+<div class="btns"><a class="btn btn-main" href="#contact">${esc(T.cta)}${icon('arrow')}</a>${callHero}</div>
+</div>
+${hero && credit(hero) ? `<p class="hero-credit">${credit(hero)}</p>` : ''}
+</section>`;
+
+  const nav = [['#services', 'Services'], ...(gallery.length ? [['#photos', 'Photos']] : []), ['#about', 'About'], ...(hours.length ? [['#hours', 'Hours']] : []), ['#book', 'Book'], ['#contact', 'Contact']]
+    .map(([h, t]) => `<a href="${h}">${t}</a>`).join('');
+
+  const v = (s) => Object.entries(s).map(([k, c]) => `--${k}:${C.toHex(c)}`).join(';');
+  const ov = tokens.overlay, a = tokens.overlayAlpha;
+  const css = `
+:root{color-scheme:light dark;${v(tokens.light)};--overlay:${C.rgba(ov, a)};--overlay-deep:${C.rgba(ov, Math.min(0.97, a + 0.14))};--glow:${C.toHex(tokens.heroGlow)};--hdr:var(--surface);--hdr-ink:var(--ink);--r:18px;--shadow:0 1px 2px rgba(15,20,30,.06),0 8px 24px rgba(15,20,30,.08)}
+@media (prefers-color-scheme:dark){:root{${v(tokens.dark)};--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35)}}
+.logo-light{--hdr:var(--band);--hdr-ink:var(--on-band)}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:128px;-webkit-text-size-adjust:100%}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{transition:none!important}}
+body{margin:0;font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;color:var(--ink);background:var(--bg)}
+img{display:block;max-width:100%}a{color:var(--link);text-underline-offset:3px}
+:focus-visible{outline:3px solid var(--focus);outline-offset:3px;border-radius:6px}
+h1,h2,h3{line-height:1.15;letter-spacing:-.015em;text-wrap:balance}
+.wrap{max-width:1140px;margin:0 auto;padding:0 20px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.skip{position:absolute;left:12px;top:-60px;z-index:60;background:var(--surface);color:var(--ink);padding:10px 14px;border-radius:10px}.skip:focus{top:12px}
+.ic{width:20px;height:20px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.top{position:sticky;top:0;z-index:40}
+.pv{background:#14202e;color:#fff;font-size:12.5px;line-height:1.4;padding:6px 0}
+.pv .wrap{display:flex;gap:4px 14px;flex-wrap:wrap;justify-content:space-between}.pv b{color:#f0a060}.pv a{color:#fff}
+.pv-more{display:none}@media(min-width:640px){.pv-more{display:inline}}
+header.site{background:var(--hdr);color:var(--hdr-ink);border-bottom:1px solid var(--line);box-shadow:0 2px 10px rgba(0,0,0,.06)}
+header.site .wrap{display:flex;align-items:center;gap:16px;min-height:62px}
+.brand{display:flex;align-items:center;gap:10px;margin-right:auto;min-width:0;color:inherit;text-decoration:none;font-weight:800;font-size:17px;line-height:1.15}
+.brand-name{overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.logo{height:42px;width:auto;max-width:min(190px,52vw);object-fit:contain}
+.mark{width:40px;height:40px;border-radius:12px;background:var(--btn);color:var(--btn-ink);display:grid;place-items:center;font-size:15px;letter-spacing:.04em;flex:none}
+@media (prefers-color-scheme:dark){.logo-dark .logo,.logo-opaque .logo{background:#fff;padding:4px 8px;border-radius:10px;height:46px}}
+nav.main{display:none;gap:22px}nav.main a{color:inherit;text-decoration:none;font-weight:600;font-size:15px;opacity:.85}nav.main a:hover{opacity:1;text-decoration:underline}
+@media(min-width:900px){nav.main{display:flex}}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:50px;padding:12px 22px;border-radius:999px;font:inherit;font-weight:700;font-size:16px;text-decoration:none;border:2px solid transparent;cursor:pointer;transition:background-color .15s,transform .15s}
+.btn-main{background:var(--btn);color:var(--btn-ink);border-color:var(--btn)}.btn-main:hover{background:var(--btn-hover);border-color:var(--btn-hover)}
+.btn-sm{min-height:44px;padding:8px 16px;font-size:15px}
+.btn-onphoto{background:rgba(255,255,255,.08);color:#fff;border-color:rgba(255,255,255,.9)}.btn-onphoto:hover{background:rgba(255,255,255,.18)}
+.btn-ghost{background:transparent;color:var(--link);border-color:var(--field)}
+.is-sample{cursor:default}.is-sample small,.tag{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;background:var(--tag-bg);color:var(--tag-ink);border-radius:6px;padding:2px 6px;vertical-align:middle}
+.hero{position:relative;isolation:isolate;overflow:hidden;color:#fff;background:radial-gradient(120% 90% at 85% 0%,var(--glow),transparent 60%),var(--band)}
+.hero-media{position:absolute;inset:0;z-index:-2}.hero-media img{width:100%;height:100%;object-fit:cover}
+.hero.has-photo::before{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(180deg,var(--overlay) 0%,var(--overlay) 45%,var(--overlay-deep) 100%)}
+.hero-inner{min-height:min(74svh,640px);display:flex;flex-direction:column;justify-content:flex-end;padding-top:48px;padding-bottom:44px}
+.hero:not(.has-photo) .hero-inner{min-height:0;padding-top:88px;padding-bottom:72px}
+.eyebrow{margin:0;font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
+.hero h1{font-size:clamp(36px,9vw,68px);margin:10px 0 14px;max-width:16ch;letter-spacing:-.025em;text-shadow:0 2px 18px rgba(0,0,0,.35)}
+.hero-sub{font-size:clamp(17px,2.4vw,21px);line-height:1.5;max-width:44ch;margin:0 0 26px}
+.btns{display:flex;gap:12px;flex-wrap:wrap}
+.hero-credit{position:absolute;right:12px;bottom:8px;margin:0;font-size:12px;color:#fff}.hero-credit a{color:#fff}
+.trust{list-style:none;margin:-30px 0 0;padding:6px;position:relative;z-index:2;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:0 4px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
+.trust li{display:flex;gap:12px;align-items:center;padding:10px 14px}.trust li+li{border-top:1px solid var(--line)}@media(min-width:700px){.trust li+li{border-top:0}}.trust .ic{color:var(--accent);width:24px;height:24px}
+.trust strong{display:block;font-size:16px;line-height:1.3;white-space:nowrap}.trust strong a{color:inherit;text-decoration:none}.trust strong a:hover{text-decoration:underline}.trust small{display:block;color:var(--muted);font-size:13px}
+.sec{padding:72px 0}.sec-tint{background:var(--tint)}
+.sec-head{max-width:640px;margin-bottom:32px}.kicker{margin:0 0 8px;color:var(--accent);font-weight:800;font-size:13px;letter-spacing:.14em;text-transform:uppercase}
+h2{font-size:clamp(27px,4.4vw,40px);margin:0 0 12px}.lead{color:var(--muted);font-size:17px;margin:0}
+.svc{list-style:none;margin:0;padding:0;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.svc li{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;align-items:baseline;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:18px 20px;box-shadow:var(--shadow);border-left:4px solid var(--btn)}
+.svc .num{grid-row:span 2;color:var(--accent);font-weight:800;font-size:14px;letter-spacing:.08em}.svc h3{font-size:18px;margin:0}.svc p{margin:0;color:var(--muted);font-size:15.5px}@media(min-width:700px){.svc li{padding:24px}}
+.gallery{list-style:none;margin:0;padding:0;display:grid;gap:10px;grid-template-columns:1fr 1fr}
+.gallery li:first-child{grid-column:1/-1}@media(min-width:760px){.gallery{grid-template-columns:repeat(3,1fr);gap:14px}.gallery li:first-child{grid-column:span 2;grid-row:span 2}}
+.gallery figure,.about-photo{margin:0;position:relative;border-radius:14px;overflow:hidden;background:var(--line);height:100%}
+.gallery img,.about-photo img{width:100%;height:100%;aspect-ratio:4/3;object-fit:cover}
+figcaption{position:absolute;left:0;right:0;bottom:0;padding:16px 10px 6px;font-size:12px;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.78))}figcaption a{color:#fff}
+.about{display:grid;gap:36px;align-items:center}@media(min-width:860px){.about.has-photo{grid-template-columns:1.1fr 1fr}}
+.about-text{font-size:19px;line-height:1.65;max-width:60ch;margin:0 0 10px}.src{color:var(--muted);font-size:14px;margin:0 0 20px}
+.socials{display:flex;gap:10px;flex-wrap:wrap}.social{display:inline-flex;align-items:center;gap:8px;min-height:44px;padding:8px 16px;border:1px solid var(--field);border-radius:999px;text-decoration:none;font-weight:600}
+.gmaps{font-family:Roboto,Arial,sans-serif;font-weight:400;white-space:nowrap}
+.grid2{display:grid;gap:32px}@media(min-width:860px){.grid2{grid-template-columns:1fr 1fr;align-items:start}}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:24px;box-shadow:var(--shadow)}
+.hours{width:100%;border-collapse:collapse;font-size:16px}.hours th,.hours td{padding:10px 4px;border-bottom:1px solid var(--line);text-align:left;font-weight:600}.hours td{font-weight:400;color:var(--muted);text-align:right}.hours tr:last-child>*{border-bottom:0}
+.steps{list-style:none;margin:24px 0 0;padding:0;display:grid;gap:12px}
+.steps li{display:flex;gap:14px;align-items:center;font-weight:700}.steps span{flex:none;width:36px;height:36px;border-radius:50%;background:var(--btn);color:var(--btn-ink);display:grid;place-items:center}
+.slots{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0}
+.slots button{min-height:46px;padding:8px;border:1px solid var(--field);border-radius:12px;background:var(--surface);color:var(--ink);font:inherit;cursor:pointer}
+.slots button[aria-pressed=true]{background:var(--btn);color:var(--btn-ink);border-color:var(--btn)}
+form label{display:block;font-weight:600;font-size:15px;margin:14px 0 6px}
+form input,form select,form textarea{width:100%;min-height:48px;padding:12px 14px;border:1px solid var(--field);border-radius:12px;font:inherit;background:var(--surface);color:var(--ink)}
+.full{width:100%;margin-top:16px}.hp{position:absolute;left:-9999px}.fine{font-size:13px;color:var(--muted);margin:12px 0 0}
+.ok{display:none;text-align:center;padding:30px 10px}.ok.show{display:block}.ok h3{margin:0 0 8px;font-size:24px}
+.foot{background:var(--band);color:var(--on-band);padding:56px 0 110px;font-size:15px}.foot a{color:var(--band-link)}
+.foot-grid{display:grid;gap:28px}@media(min-width:760px){.foot-grid{grid-template-columns:1.2fr 1fr}}
+.foot-name{font-size:22px;font-weight:800;margin:0 0 6px}.foot p{margin:0 0 8px;color:var(--on-band-muted)}.foot h2{font-size:16px;margin:0 0 8px;color:var(--on-band)}
+.foot .social{border-color:var(--on-band-muted);color:var(--on-band)}.foot .socials{margin-top:14px}
+`;
+
+  const script = `
+(()=>{const LEAD=${JSON.stringify(LEAD_URL).replace(/</g, '\\u003c')},SLUG=${JSON.stringify(slug)};
+document.querySelectorAll('img[data-ext]').forEach(i=>{const gone=()=>{const p=i.closest('[data-photo]')||i.closest('.hero-media');if(p)p.remove();else i.remove();const h=document.querySelector('.hero');if(h&&!h.querySelector('.hero-media'))h.classList.remove('has-photo')};if(i.complete&&i.naturalWidth===0&&i.getAttribute('loading')!=='lazy')gone();else i.addEventListener('error',gone)});
 const f=document.getElementById('lead'),ok=document.getElementById('ok');
 f.addEventListener('submit',e=>{e.preventDefault();const d=new FormData(f),em=String(d.get('email')||'').trim();
 if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(em)){f.email.focus();f.email.setCustomValidity('Enter an email address');f.email.reportValidity();return}f.email.setCustomValidity('');
@@ -145,25 +379,103 @@ fetch(LEAD,{method:'POST',mode:'no-cors',body:b}).catch(()=>{});
 document.getElementById('okmsg').textContent='Check your inbox: a personal reply is on its way, usually in under a minute.'}
 else{document.getElementById('okmsg').textContent='On the live site, a personal reply lands in this inbox within a minute. (The preview reply is being switched on.)'}
 document.getElementById('okname').textContent=first?', '+first:'';f.hidden=true;ok.classList.add('show');ok.focus()});
-document.getElementById('again').onclick=()=>{f.reset();f.hidden=false;ok.classList.remove('show')};
+f.email.addEventListener('input',()=>f.email.setCustomValidity(''));
+document.getElementById('again').onclick=()=>{f.reset();f.hidden=false;ok.classList.remove('show');f.querySelector('input').focus()};
 const slots=[...document.querySelectorAll('.slots button')];let pick=null;
 slots.forEach(s=>s.onclick=()=>{slots.forEach(x=>x.setAttribute('aria-pressed','false'));s.setAttribute('aria-pressed','true');pick=s.textContent});
 document.getElementById('bookbtn').onclick=()=>{document.getElementById('bookmsg').textContent=pick?'Booked for '+pick+'. On the live site this goes on the calendar and the customer gets a confirmation and a reminder.':'Pick a time first.'};
 })();
-</script>
+`;
+  const scriptHash = crypto.createHash('sha256').update(script).digest('base64');
+  const csp = [
+    "default-src 'none'", "img-src 'self' https:", "style-src 'unsafe-inline'", `script-src 'sha256-${scriptHash}'`,
+    `connect-src ${LEAD_URL ? new URL(LEAD_URL).origin : "'none'"}`, "base-uri 'none'", "form-action 'none'",
+  ].join('; ');
+
+  const html = `<!doctype html>
+<html lang="en" class="${logoClass}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="${esc(csp)}">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="${C.toHex(tokens.light.band)}">
+${logo ? '<link rel="icon" href="logo.png">\n' : ''}<title>${esc(name)} (preview by Bookcliff Web)</title>
+<meta name="description" content="A preview website built by Bookcliff Web for ${esc(name)}. Not the official site.">
+<style>${css}</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="top">
+<div class="pv" role="note"><div class="wrap"><span><b>Preview</b> by Bookcliff Web. Not ${esc(name)}'s official site. Expires ${expires}.</span><span class="pv-more">Hidden from Google · <a href="https://bookcliffweb.com" rel="noopener">bookcliffweb.com</a></span></div></div>
+<header class="site"><div class="wrap"><a class="brand" href="#top">${brandHtml}</a>
+<nav class="main" aria-label="Main">${nav}</nav>${callSmall}</div></header>
+</div>
+<main id="main">
+<div id="top"></div>
+${heroHtml}
+${trustHtml}
+<section id="services" class="sec" aria-labelledby="services-h"><div class="wrap">
+<div class="sec-head"><p class="kicker">Services <span class="tag">sample</span></p><h2 id="services-h">${esc(T.headline(name, town))}</h2><p class="lead">Typical ${esc(T.noun)} services. On the real site, these are ${esc(name)}'s own, in their own words.</p></div>
+<ul class="svc">${services}</ul></div></section>
+${galleryHtml}
+${aboutHtml}
+${hoursHtml}
+<section id="book" class="sec${hours.length ? '' : ' sec-tint'}" aria-labelledby="book-h"><div class="wrap grid2">
+<div><p class="kicker">Book online <span class="tag">demo</span></p><h2 id="book-h">Pick a time in a few taps</h2><p class="lead">Customers choose a time without a phone call. It lands on your calendar with a reminder for them.</p><ol class="steps">${steps}</ol></div>
+<div class="card" id="bookcard"><strong>Pick a time</strong> <span class="tag">demo</span><div class="slots" role="group" aria-label="Sample times">
+<button type="button" aria-pressed="false">Mon 9:00</button><button type="button" aria-pressed="false">Mon 1:00</button><button type="button" aria-pressed="false">Tue 10:30</button><button type="button" aria-pressed="false">Wed 8:00</button><button type="button" aria-pressed="false">Thu 2:00</button><button type="button" aria-pressed="false">Fri 11:00</button></div>
+<button class="btn btn-main full" id="bookbtn" type="button">Confirm time</button><p class="fine" id="bookmsg" role="status"></p></div>
+</div></section>
+<section id="contact" class="sec${hours.length ? ' sec-tint' : ''}" aria-labelledby="contact-h"><div class="wrap grid2">
+<div><p class="kicker">Contact</p><h2 id="contact-h">${esc(T.cta)}</h2><p class="lead">Send a message and get a personal reply by email within a minute, any time of day.</p>
+<p class="fine">Try it with your own email address: that's the reply your customers would get.</p></div>
+<div class="card"><form id="lead" novalidate>
+<label for="f-name">Your name</label><input id="f-name" name="name" autocomplete="name" required>
+<label for="f-email">Email</label><input id="f-email" name="email" type="email" autocomplete="email" required>
+<label for="f-phone">Phone (optional)</label><input id="f-phone" name="phone" type="tel" autocomplete="tel">
+<label for="f-service">What do you need?</label><select id="f-service" name="service">${options}<option>Something else</option></select>
+<label for="f-msg">Details</label><textarea id="f-msg" name="message" rows="4"></textarea>
+<input class="hp" tabindex="-1" autocomplete="off" name="_gotcha" aria-hidden="true">
+<button class="btn btn-main full" type="submit">Send</button>
+<p class="fine">Preview form: your email gets one sample reply from Bookcliff Web and is not saved to any list.</p>
+</form><div class="ok" id="ok" tabindex="-1" role="status"><h3>Thanks<span id="okname"></span>!</h3><p id="okmsg"></p><button class="btn btn-ghost" id="again" type="button">Send another</button></div></div>
+</div></section>
+</main>
+<footer class="foot"><div class="wrap foot-grid">
+<div><p class="foot-name">${esc(name)}</p><p>${esc(town)}, Colorado${phone ? ` · <a href="${esc(telHref(phone))}">${esc(phone)}</a>` : ''}</p>${socialHtml ? `<div class="socials">${socialHtml}</div>` : ''}
+${places?.mapsUri ? `<p class="fine"><a href="${esc(places.mapsUri)}" rel="noopener">Their listing on ${googleMark}</a></p>` : ''}</div>
+<div><h2>About this preview</h2><p>A preview built ${built} by <a href="https://bookcliffweb.com" rel="noopener">Bookcliff Web</a>. It is not ${esc(name)}'s official site, it is hidden from Google, and it expires ${expires}.</p>
+<p>Want this site for real? <a href="${BOOKCLIFF_CAL}" rel="noopener">Book a free 15-minute call</a>.</p></div>
+</div></footer>
+<script>${script}</script>
 </body>
 </html>
 `;
 
-fs.mkdirSync(path.join(outDir, slug), { recursive: true });
-fs.writeFileSync(path.join(outDir, slug, 'index.html'), html);
-fs.writeFileSync(path.join(outDir, 'robots.txt'), 'User-agent: *\nDisallow: /\n');
-const listPath = path.join(outDir, 'previews.json');
-let list = [];
-try { list = JSON.parse(fs.readFileSync(listPath, 'utf8')); } catch { list = []; }
-list = list.filter((p) => p.slug !== slug);
-// --request: the portal's request ID, so the portal can find this preview's link once it's built.
-const request = opt('--request', '');
-list.push({ slug, business: name, trade: tradeKey, town, built, expires, ...(/^[\w-]{1,64}$/.test(request) ? { request } : {}) });
-fs.writeFileSync(listPath, JSON.stringify(list, null, 2) + '\n');
-console.log(JSON.stringify({ slug, business: name, trade: tradeKey, town, expires, file: path.join(outDir, slug, 'index.html') }));
+  fs.mkdirSync(path.join(outDir, slug), { recursive: true });
+  fs.writeFileSync(path.join(outDir, slug, 'index.html'), html);
+  if (logo) fs.writeFileSync(path.join(outDir, slug, 'logo.png'), logo.png);
+  fs.writeFileSync(path.join(outDir, 'robots.txt'), 'User-agent: *\nDisallow: /\n');
+  const listPath = path.join(outDir, 'previews.json');
+  let list = [];
+  try { list = JSON.parse(fs.readFileSync(listPath, 'utf8')); } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  list = list.filter((p) => p.slug !== slug);
+  // --request: the portal's request ID, so the portal can find this preview's link once it's built.
+  const request = opt('--request', '');
+  list.push({ slug, business: name, trade: tradeKey, town, built, expires, ...(/^[\w-]{1,64}$/.test(request) ? { request } : {}) });
+  fs.writeFileSync(listPath, JSON.stringify(list, null, 2) + '\n');
+  const sourcesUsed = {
+    places: Boolean(places), site: Boolean(site), logo: logo ? logo.from : null, photos: photos.length,
+    palette: paletteFrom, phone: phoneArg ? 'given' : places?.phone ? 'google' : site?.phone ? 'site' : 'sample',
+  };
+  console.log(JSON.stringify({ slug, business: name, trade: tradeKey, town, expires, file: path.join(outDir, slug, 'index.html'), sources: sourcesUsed }));
+}
+
+main().catch((err) => {
+  console.error(`[preview] build failed: ${err?.stack || err}`);
+  process.exit(1);
+});

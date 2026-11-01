@@ -1,0 +1,16 @@
+{
+  "name": "bookcliff-preview-builder",
+  "private": true,
+  "description": "Builds prospect preview sites (D-035). See the header comment in build-preview.js.",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build-preview": "node build-preview.js",
+    "test": "node --test test/preview.test.js"
+  },
+  "dependencies": {
+    "sharp": "0.35.5"
+  }
+}
