@@ -15,5 +15,14 @@
     "town": "Grand Junction",
     "built": "2026-11-01",
     "expires": "2026-11-15"
+  },
+  {
+    "slug": "elite-pest-and-wildlife-control-of-gj-77d216",
+    "business": "Elite Pest & Wildlife Control of GJ",
+    "trade": "general",
+    "town": "Grand Junction",
+    "built": "2026-11-01",
+    "expires": "2026-11-15",
+    "request": "1b473892-5510-486d-be2a-17950d2c7553"
   }
 ]
