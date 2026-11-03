@@ -67,7 +67,7 @@ const crypto = require('node:crypto');
 const TRADES = require('./trades');
 const { createBudget, httpUrl, fetchCapped, attempt } = require('./net');
 const { readPlaces, readSite, socialFromUrl, claimFree } = require('./sources');
-const { loadLogo, photoColorEntries } = require('./brand');
+const { loadLogo, photoColorEntries, imageSize, hasSharp } = require('./brand');
 const C = require('./colors');
 const ART = require('./art');
 
@@ -84,6 +84,12 @@ const telHref = (phone) => { const d = phone.replace(/[^\d+]/g, ''); return `tel
 // Squarespace's image CDN resizes by query string, so their photos get a srcset instead of 2 MB originals.
 function responsive(url, widths) {
   const u = new URL(url);
+  // Wix (D-061): the original is static.wixstatic.com/media/<file>; sized copies are /v1/fit/w_W,h_W,.../<file>.
+  const wix = /^https:\/\/static\.wixstatic\.com\/media\/([^/?#]+)$/i.exec(u.href);
+  if (wix) {
+    const at = (w) => `${u.href}/v1/fit/w_${w},h_${w},q_85,enc_auto/${wix[1]}`;
+    return { src: at(widths[widths.length - 1]), srcset: widths.map((w) => `${at(w)} ${w}w`).join(', ') };
+  }
   if (/(^|\.)squarespace-cdn\.com$|(^|\.)squarespace\.com$/.test(u.hostname)) {
     const at = (w) => { const v = new URL(u.href); v.searchParams.set('format', `${w}w`); return v.href; };
     return { src: at(widths[widths.length - 1]), srcset: widths.map((w) => `${at(w)} ${w}w`).join(', ') };
@@ -108,8 +114,10 @@ async function validatePhoto(p, budget) {
   const u = httpUrl(p.url);
   if (!u) return null;
   if (u.protocol === 'http:') u.protocol = 'https:';
-  const res = await fetchCapped(u.href, { budget, headersOnly: true, maxBytes: 8 * 1024 * 1024, accept: /^image\/(jpeg|png|webp|avif|gif)/ });
-  return { ...p, url: res.url };
+  // Check the copy the page will show (a CDN's sized copy where there is one), not a many-megabyte original.
+  const shown = responsive(u.href, [1600]).src;
+  const res = await fetchCapped(shown, { budget, headersOnly: true, maxBytes: 8 * 1024 * 1024, accept: /^image\/(jpeg|png|webp|avif|gif)/ });
+  return { ...p, url: shown === u.href ? res.url : u.href };
 }
 
 // Free-licensed photos for a sample (D-058). Throws on anything unsafe or unlicensed; returns the photos with
@@ -234,19 +242,43 @@ async function main() {
   const toCheck = [...ownerPhotos, ...(site?.photos || []).map((p) => ({ ...p, source: 'site' }))].slice(0, 12);
   const checked = await Promise.all(toCheck.map((p) => attempt(`photo from ${p.source}`, () => validatePhoto(p, budget))));
   const seenPhoto = new Set();
-  const photos = [...checked.filter((p) => p && p.source === 'owner'), ...(places?.photos || []), ...checked.filter((p) => p && p.source === 'site')]
+  let photos = [...checked.filter((p) => p && p.source === 'owner'), ...(places?.photos || []), ...checked.filter((p) => p && p.source === 'site')]
     .filter((p) => { const k = p.url.split('?')[0]; if (seenPhoto.has(k) || (logo && logo.url.split('?')[0] === k)) return false; seenPhoto.add(k); return true; })
-    .slice(0, 6);
+    .slice(0, 8);
+  // Each photo is measured (D-061): the page's own width and height are display sizes or placeholders. Photos
+  // under 480 px on their short side are dropped, so nothing on the preview is stretched or blurry.
+  if (hasSharp() && photos.length) {
+    await Promise.all(photos.map(async (p) => {
+      const size = await attempt('photo size', () => imageSize(responsive(p.url, [1600]).src, { budget }));
+      if (size) Object.assign(p, size, { measured: true });
+    }));
+    photos = photos.filter((p) => !p.measured || Math.min(p.width, p.height) >= 480);
+  }
+  photos = photos.slice(0, 7);
   const heroIndex = Math.max(0, photos.findIndex((p) => !p.width || (p.width >= 800 && p.width / p.height >= 1.15 && p.width / p.height <= 2.4)));
   const sp = samplePhotos.photos;
   // A prospect with 4 or more photos of their own gets a rotating hero of 2 or 3 of them, in colour (D-058); the
   // rest fill the gallery. Fewer photos: one hero photo with a slow zoom, as before.
-  const wide = (p) => !p.width || (p.width >= 800 && p.width / p.height >= 1.15 && p.width / p.height <= 2.4);
-  const heroCount = photos.length >= 5 ? 3 : photos.length === 4 ? 2 : 1;
-  const prospectHeroes = heroCount > 1 && photos.filter(wide).length >= heroCount ? photos.filter(wide).slice(0, heroCount) : photos.length ? [photos[heroIndex]] : [];
+  // Their photos' own labels (D-061): a photo whose alt names a service becomes that service's card; one of the
+  // owners or team goes in About. Only their own words, from their own page.
+  const ABOUT_ALT = /\b(owners?|team|founders?|family|crew|staff|meet)\b/i;
+  const labelled = (p) => p.alt && p.alt.length <= 48 && !/\.(jpe?g|png|webp|avif)$/i.test(p.alt) && /[a-z]{3}/i.test(p.alt);
+  const servicePhotos = sp.length ? [] : photos.filter((p) => labelled(p) && !ABOUT_ALT.test(p.alt));
+  const photoServices = servicePhotos.length >= 3 ? servicePhotos.slice(0, 6) : [];
+  const teamPhoto = sp.length ? null : photos.find((p) => labelled(p) && ABOUT_ALT.test(p.alt)) || null;
+  const free = photos.filter((p) => !photoServices.includes(p) && p !== teamPhoto);
+  // A full-width photo hero needs a sharp, wide photo (1100 px or more). With 2 or more of those and 4+ photos, it
+  // rotates; with one, the business's name picks the layout (full photo or split with a framed photo), so previews
+  // don't all look alike; a smaller photo is always framed, never stretched.
+  const big = (p) => (p.width >= 1100 || (!p.measured && !p.width)) && p.width / (p.height || 1) >= 1.15 && p.width / (p.height || 1) <= 2.6;
+  const bigOnes = free.filter(big);
+  const heroCount = photos.length >= 5 ? 3 : photos.length >= 4 ? 2 : 1;
+  const prospectHeroes = heroCount > 1 && bigOnes.length >= heroCount ? bigOnes.slice(0, heroCount) : bigOnes.length ? [bigOnes[0]] : free.length ? [free[0]] : [];
   const heroes = sp.length ? sp.filter((p) => p.role === 'hero') : prospectHeroes;
   const hero = heroes[0] || null;
-  const rest = sp.length ? sp.filter((p) => p.role === 'gallery') : photos.filter((p) => !heroes.includes(p));
+  const nameHash = [...slugBase].reduce((a, ch) => (a * 31 + ch.charCodeAt(0)) >>> 0, 7);
+  const split = !sp.length && heroes.length === 1 && hero && (!big(hero) || nameHash % 2 === 1);
+  const rest = sp.length ? sp.filter((p) => p.role === 'gallery') : free.filter((p) => !heroes.includes(p));
 
   // ---------- trade, facts, palette ----------
   const tradeKey = tradeFlag || findTrade(rawName) || [places?.category, ...(site?.tradeHints || [])].map(findTrade).find(Boolean) || 'general';
@@ -261,6 +293,11 @@ async function main() {
   if (logo) {
     const p = C.pickPalette(logo.entries, logo.mode);
     if (p.primary) { palette = p; paletteFrom = 'logo'; }
+  }
+  // The colors their own site's styles use most (D-061), before a single theme-color or a photo's colors.
+  if (!palette && site?.cssColors?.length) {
+    const p = C.pickPalette(site.cssColors, 'logo');
+    if (p.primary) { palette = p; paletteFrom = 'site styles'; }
   }
   const theme = site?.themeColor;
   if (!palette && theme && C.chroma(theme) >= 0.12 && C.toHsl(theme).l > 0.08 && C.toHsl(theme).l < 0.92) { palette = { primary: theme, accent: null, dark: null }; paletteFrom = 'theme-color'; }
@@ -319,14 +356,19 @@ async function main() {
   const trustHtml = trust.length >= 2 ? `<div class="wrap"><ul class="trust" aria-label="At a glance">${trust.join('')}</ul></div>` : '';
 
   // Their own services when the lookup found at least 3 on their website (D-060); otherwise the trade's samples.
-  const ownServices = theirServices.length >= 3;
-  const serviceList = ownServices ? theirServices.map((h) => [h, '']) : T.services;
-  const services = serviceList.map(([h, p], i) => `<li data-reveal><span class="num" aria-hidden="true">${String(i + 1).padStart(2, '0')}</span><h3>${esc(h)}</h3>${p ? `<p>${esc(p)}</p>` : ''}</li>`).join('');
+  // Or their photos' service labels with the photos themselves (D-061).
+  const ownServices = theirServices.length >= 3 || photoServices.length >= 3;
+  const serviceList = theirServices.length >= 3
+    ? theirServices.map((h) => [h, '', photoServices.find((p) => p.alt.toLowerCase() === h.toLowerCase()) || null])
+    : photoServices.length ? photoServices.map((p) => [p.alt, '', p]) : T.services.map(([h, p]) => [h, p, null]);
+  const services = serviceList.map(([h, p, ph], i) => ph
+    ? `<li data-reveal class="svc-photo" data-photo><figure>${img(ph, i + 1, { sizes: '(min-width: 760px) 30vw, 100vw', lazy: true }).replace(/ alt="[^"]*"/, ' alt=""')}</figure><h3>${esc(h)}</h3>${p ? `<p>${esc(p)}</p>` : ''}</li>`
+    : `<li data-reveal><span class="num" aria-hidden="true">${String(i + 1).padStart(2, '0')}</span><h3>${esc(h)}</h3>${p ? `<p>${esc(p)}</p>` : ''}</li>`).join('');
   const options = serviceList.map(([h]) => `<option>${esc(h)}</option>`).join('');
   const steps = T.steps.map((s, i) => `<li><span aria-hidden="true">${i + 1}</span>${esc(s)}</li>`).join('');
 
   const gallery = rest.length >= 2 ? rest : [];
-  const aboutPhoto = sp.length ? sp.find((p) => p.role === 'about') || null : rest.length === 1 ? rest[0] : null;
+  const aboutPhoto = sp.length ? sp.find((p) => p.role === 'about') || null : teamPhoto || (rest.length === 1 ? rest[0] : null);
   const fig = (p, i, sizes) => {
     const c = credit(p);
     return `<li data-photo data-reveal><figure>${img(p, i + 1, { sizes, lazy: true })}${c ? `<figcaption>${c}</figcaption>` : ''}</figure></li>`;
@@ -371,7 +413,17 @@ ${aboutPhoto ? `<figure class="about-photo" data-photo data-reveal>${img(aboutPh
   // Samples rotate in faded black and white; a prospect's own photos rotate in colour.
   const slides = samplePhotos.slides || (!sp.length && heroes.length >= 2);
   const bwSlides = slides && sp.length > 0;
-  const heroHtml = hero
+  const heroHtml = split
+    ? `<section class="hero hero-split" aria-labelledby="h1">
+<div class="wrap split-inner">
+<div class="hero-copy">
+${heroCopy}
+</div>
+<figure class="split-photo" data-photo>${img(hero, 0, { sizes: '(min-width: 900px) 46vw, 100vw', lazy: false })}${credit(hero) ? `<figcaption>${credit(hero)}</figcaption>` : ''}</figure>
+</div>
+${ART.ridge()}
+</section>`
+    : hero
     ? `<section class="hero has-photo${slides ? ' has-slides' : ' has-zoom'}${bwSlides ? ' slides-bw' : ''}" aria-labelledby="h1">
 <div class="hero-media${slides ? ' hero-slides' : ''}">${slides ? heroes.map((p, i) => {
     // Every slide loads at once (a hidden lazy image may never be fetched); only the first is urgent. Each is its
@@ -420,6 +472,23 @@ ${heroes.map((_, i) => `.hero-slides img:nth-child(${i + 1}){animation-delay:${i
     }
     return hero ? `.has-zoom .hero-media img{animation:zoom 22s ease-out both}@keyframes zoom{from{transform:scale(1.08)}to{transform:scale(1)}}` : '';
   })();
+  // Their fonts (D-061): the Google Fonts their site uses, or the closest free match for its paid ones.
+  const SINGLE_WEIGHT = new Set(['Questrial', 'Righteous', 'Russo One', 'Archivo Black', 'Fjalla One', 'Anton', 'Bebas Neue', 'Abril Fatface']);
+  const fonts = SAMPLE ? null : site?.fonts || null;
+  const fontFam = (f) => `family=${f.replace(/ /g, '+')}${SINGLE_WEIGHT.has(f) ? '' : ':wght@400;600;700'}`;
+  const fontsHref = fonts ? `https://fonts.googleapis.com/css2?${[fonts.heading, fonts.body].filter(Boolean).map(fontFam).join('&')}&display=swap` : '';
+  const designCss = `
+.hero-split{background:var(--band);background:radial-gradient(110% 80% at 100% 0%,var(--glow),transparent 60%),linear-gradient(160deg,var(--band),color-mix(in srgb,var(--band) 72%,var(--btn)))}
+.split-inner{position:relative;z-index:1;display:grid;gap:34px;align-items:center;padding-top:44px;padding-bottom:clamp(72px,10vw,120px)}
+@media(min-width:900px){.split-inner{grid-template-columns:1.05fr .95fr;gap:52px;padding-top:76px}}
+.split-photo{position:relative;margin:0 14px 14px 0;isolation:isolate}
+.split-photo::before{content:"";position:absolute;inset:16px -14px -14px 16px;border-radius:26px;background:var(--btn);z-index:-1}
+.split-photo img{width:100%;height:auto;aspect-ratio:4/3;object-fit:cover;border-radius:26px;box-shadow:0 30px 60px rgba(0,0,0,.35)}
+.split-photo figcaption{border-radius:0 0 26px 26px}
+.svc li.svc-photo{display:block;padding:0}.svc-photo figure{margin:0;aspect-ratio:4/3;overflow:hidden;background:var(--line)}
+.svc-photo img{width:100%;height:100%;object-fit:cover;aspect-ratio:4/3;transition:transform .8s cubic-bezier(.2,.7,.2,1)}.svc-photo:hover img{transform:scale(1.05)}
+.svc-photo h3{padding:16px 20px 4px}.svc-photo p{padding:0 20px 18px}.svc-photo h3:last-child{padding-bottom:20px}
+${fonts ? `h1,h2,h3,.brand-name,.foot-name,.btn{font-family:"${fonts.heading}",system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}${fonts.body ? `body{font-family:"${fonts.body}",system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}` : ''}${SINGLE_WEIGHT.has(fonts.heading) || /Oswald|Teko|Barlow Condensed/.test(fonts.heading) ? 'h1,h2{letter-spacing:.01em;font-weight:600}' : ''}` : ''}`;
   const ov = tokens.overlay, a = tokens.overlayAlpha;
   const css = `
 :root{color-scheme:light dark;${v(tokens.light)};--overlay:${C.rgba(ov, a)};--overlay-deep:${C.rgba(ov, Math.min(0.97, a + 0.14))};--glow:${C.toHex(tokens.heroGlow)};--hdr:var(--surface);--hdr-ink:var(--ink);--r:18px;--shadow:0 1px 2px rgba(15,20,30,.06),0 8px 24px rgba(15,20,30,.08)}
@@ -516,7 +585,7 @@ form input,form select,form textarea{width:100%;min-height:48px;padding:12px 14p
 .foot-grid{display:grid;gap:28px}@media(min-width:760px){.foot-grid{grid-template-columns:1.2fr 1fr}}
 .credits{grid-column:1/-1;border-top:1px solid rgba(255,255,255,.18);padding-top:20px;font-size:13px}.credits h2{font-size:15px}.credits ul{margin:0 0 8px;padding-left:18px;color:var(--on-band-muted)}.credits li{margin:0 0 4px}
 .foot-name{font-size:22px;font-weight:800;margin:0 0 6px}.foot p{margin:0 0 8px;color:var(--on-band-muted)}.foot h2{font-size:16px;margin:0 0 8px;color:var(--on-band)}
-.foot .social{border-color:var(--on-band-muted);color:var(--on-band)}.foot .socials{margin-top:14px}${slidesCss}
+.foot .social{border-color:var(--on-band-muted);color:var(--on-band)}.foot .socials{margin-top:14px}${slidesCss}${designCss}
 .gallery img{transition:transform .8s cubic-bezier(.2,.7,.2,1)}.gallery figure:hover img{transform:scale(1.05)}
 .rv{opacity:0;transform:translateY(22px);transition:opacity .7s ease,transform .7s cubic-bezier(.2,.7,.2,1)}.rv.in{opacity:1;transform:none}
 .svc li.rv:nth-child(2),.gallery li.rv:nth-child(2){transition-delay:.08s}.svc li.rv:nth-child(3),.gallery li.rv:nth-child(3){transition-delay:.16s}.svc li.rv:nth-child(4),.gallery li.rv:nth-child(4){transition-delay:.24s}.gallery li.rv:nth-child(5){transition-delay:.32s}
@@ -546,7 +615,8 @@ document.getElementById('bookbtn').onclick=()=>{document.getElementById('bookmsg
 `;
   const scriptHash = crypto.createHash('sha256').update(script).digest('base64');
   const csp = [
-    "default-src 'none'", "img-src 'self' https:", "style-src 'unsafe-inline'", `script-src 'sha256-${scriptHash}'`,
+    "default-src 'none'", "img-src 'self' https:", `style-src 'unsafe-inline'${fontsHref ? ' https://fonts.googleapis.com' : ''}`, `script-src 'sha256-${scriptHash}'`,
+    ...(fontsHref ? ['font-src https://fonts.gstatic.com'] : []),
     `connect-src ${LEAD_URL ? new URL(LEAD_URL).origin : "'none'"}`, "base-uri 'none'", "form-action 'none'",
   ].join('; ');
 
@@ -563,7 +633,7 @@ document.getElementById('bookbtn').onclick=()=>{document.getElementById('bookmsg
 <meta name="theme-color" content="${C.toHex(tokens.light.band)}">
 ${logo ? '<link rel="icon" href="logo.png">\n' : ''}<title>${esc(name)} (${SAMPLE ? 'sample design' : 'preview'} by Bookcliff Web)</title>
 <meta name="description" content="${SAMPLE ? `A sample website by Bookcliff Web. ${esc(name)} is a made-up business.` : `A preview website built by Bookcliff Web for ${esc(name)}. Not the official site.`}">
-<style>${css}</style>
+${fontsHref ? `<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n<link rel="stylesheet" href="${esc(fontsHref)}">\n` : ''}<style>${css}</style>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>

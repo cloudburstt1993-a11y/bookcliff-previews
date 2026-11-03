@@ -59,7 +59,7 @@ function namesMatch(a, b) {
 
 // Sentences that make claims a preview must not repeat (ratings, reviews, awards, licenses, prices,
 // guarantees, superlatives about rank) are dropped from any outside description.
-const CLAIM = /(\b\d(\.\d)?\s*(stars?|★)|★|\brated\b|\breviews?\b|\baward|\blicen[cs]|\binsured\b|\bbonded\b|\bcertified\b|\bbest\b|#\s*1\b|\bnumber one\b|\bguarantee|\$\s*\d|\bprices?\b|\bcheapest\b|\bfree\b|\btop[- ]rated\b|\bfive[- ]star\b|\byears? (of )?experience\b|\bsince (19|20)\d\d\b|\bvoted\b|\bwinner\b|\bfavorite\b|\bpremier\b|\bleading\b)/i;
+const CLAIM = /(\b\d(\.\d)?\s*(stars?|★)|★|\brated\b|\breviews?\b|\baward|\blicen[cs]|\binsured\b|\bbonded\b|\bcertified\b|\bbest\b|#\s*1\b|\bnumber one\b|\bguarantee|\$\s*\d|\bprices?\b|\bcheapest\b|\bfree\b|\btop[- ]rated\b|\bfive[- ]star\b|\byears? (of )?experience\b|\b\d+\+?\s*(years|yrs)\b|\bdecades?\b|\bsince (19|20)\d\d\b|\bvoted\b|\bwinner\b|\bfavorite\b|\bpremier\b|\bleading\b)/i;
 function claimFree(text, max = 420) {
   const sentences = clean(text, 2000).split(/(?<=[.!?])\s+/);
   let out = '';
@@ -144,6 +144,87 @@ function socialLink(u) {
   return null;
 }
 
+// Site builders that put a tiny, pre-blurred placeholder in the HTML and swap the real photo in with JavaScript.
+// Wix: static.wixstatic.com/media/<file>/v1/fill/w_113,h_75,...,blur_2/<file> -> the original
+// static.wixstatic.com/media/<file> (the preview asks for sized copies, see build-preview.js responsive()).
+function fullSizeImage(u) {
+  const wix = /^(https:\/\/static\.wixstatic\.com\/media\/[^/?#]+)\/v1\//i.exec(u || '');
+  if (wix) return wix[1];
+  return u;
+}
+
+// The colors a site's own styles use, weighted by how often: CSS custom properties are resolved where used
+// (including Wix's palette, --color_N: "r,g,b"), plus literal background, text, border, fill and stroke colors.
+// Grays, near-black and near-white are left for pickPalette to drop.
+function colorOf(v) {
+  const s = String(v).trim();
+  let m = /^#([0-9a-f]{3}|[0-9a-f]{6})\b/i.exec(s);
+  if (m) return parseColor('#' + m[1]);
+  m = /^rgba?\(\s*(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})(?:[\s,/]+([\d.]+%?))?\s*\)/i.exec(s);
+  if (m && !(m[4] !== undefined && parseFloat(m[4]) < 0.5)) return { r: Math.min(255, +m[1]), g: Math.min(255, +m[2]), b: Math.min(255, +m[3]) };
+  m = /^(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})$/.exec(s);
+  if (m) return { r: Math.min(255, +m[1]), g: Math.min(255, +m[2]), b: Math.min(255, +m[3]) };
+  return null;
+}
+function cssText(html) {
+  const parts = [];
+  html.replace(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi, (m, body) => { if (parts.length < 120) parts.push(body.slice(0, 500000)); return ''; });
+  html.replace(/\sstyle\s*=\s*"([^"]{1,2000})"/gi, (m, st) => { if (parts.length < 800) parts.push(st); return ''; });
+  return parts.join('\n').slice(0, 4000000);
+}
+function cssColorEntries(css) {
+  const vars = new Map();
+  let m;
+  const varRe = /--([\w-]{1,60})\s*:\s*([^;}{]{1,80})/g;
+  while ((m = varRe.exec(css)) !== null) { const c = colorOf(m[2]); if (c) vars.set(m[1], c); }
+  const weights = new Map();
+  const add = (c, w) => { const k = `${c.r},${c.g},${c.b}`; weights.set(k, (weights.get(k) || 0) + w); };
+  const useRe = /var\(\s*--([\w-]{1,60})\s*[,)]/g;
+  while ((m = useRe.exec(css)) !== null) { const c = vars.get(m[1]); if (c) add(c, 1); }
+  const litRe = /(?:^|[;{\s])(?:background(?:-color)?|color|border(?:-[a-z]+)?-color|fill|stroke)\s*:\s*([^;}{]{3,60})/gi;
+  while ((m = litRe.exec(css)) !== null) { const c = colorOf(m[1]); if (c) add(c, 1); }
+  return [...weights].map(([k, w]) => { const [r, g, b] = k.split(',').map(Number); return { r, g, b, w }; });
+}
+
+// The site's fonts as Google Fonts the preview can load: a Google Fonts family the site uses, or the closest free
+// match for a common paid one (Futura, Avenir, DIN, Brandon, Proxima, Gotham, ...). Heading first, then body.
+const GOOGLE_FONTS = ['Montserrat', 'Poppins', 'Lato', 'Raleway', 'Oswald', 'Roboto', 'Open Sans', 'Nunito', 'Nunito Sans', 'Merriweather', 'Playfair Display',
+  'Source Sans 3', 'Work Sans', 'Inter', 'DM Sans', 'Barlow', 'Barlow Condensed', 'Josefin Sans', 'Jost', 'Rubik', 'Quicksand', 'Cabin', 'Archivo', 'Karla',
+  'Libre Baskerville', 'Lora', 'PT Sans', 'PT Serif', 'Bitter', 'Zilla Slab', 'Roboto Slab', 'Bebas Neue', 'Anton', 'Fjalla One', 'Teko', 'Abril Fatface',
+  'Outfit', 'Manrope', 'Mulish', 'Urbanist', 'Sora', 'Lexend', 'Figtree', 'Plus Jakarta Sans', 'Libre Franklin', 'Cormorant Garamond', 'EB Garamond', 'Arvo',
+  'Oxygen', 'Hind', 'Ubuntu', 'Exo 2', 'Kanit', 'Titillium Web', 'Questrial', 'Alegreya', 'Crimson Text', 'Spectral', 'Archivo Black', 'Russo One', 'Righteous'];
+const FONT_MATCH = [[/futura/, 'Jost'], [/avenir/, 'Nunito Sans'], [/\bdin\b|din[- ]?next|din[- ]?pro/, 'Barlow'], [/brandon/, 'Josefin Sans'],
+  [/proxima/, 'Montserrat'], [/gotham/, 'Montserrat'], [/century gothic/, 'Questrial'], [/impact/, 'Oswald'], [/helvetica neue|neue haas/, 'Inter'],
+  [/gill sans/, 'Lato'], [/trade gothic|franklin gothic/, 'Libre Franklin'], [/garamond/, 'EB Garamond'], [/baskerville/, 'Libre Baskerville'],
+  [/museo/, 'Nunito'], [/sofia pro/, 'Figtree'], [/circular/, 'DM Sans'], [/bebas/, 'Bebas Neue'], [/league gothic|knockout/, 'Oswald'], [/didot|bodoni/, 'Playfair Display']];
+const DISPLAY = new Set(['Oswald', 'Bebas Neue', 'Anton', 'Fjalla One', 'Teko', 'Abril Fatface', 'Archivo Black', 'Russo One', 'Righteous', 'Barlow Condensed', 'Playfair Display']);
+function siteFonts(html, css) {
+  const counts = new Map();
+  const add = (fam, w) => { if (fam) counts.set(fam, (counts.get(fam) || 0) + w); };
+  const toGoogle = (raw) => {
+    const n = String(raw).replace(/["']/g, '').trim().toLowerCase();
+    if (!n || /^(inherit|initial|serif|sans-serif|monospace|system-ui|-apple-system|arial|helvetica|times|georgia|verdana|tahoma)$/.test(n)) return null;
+    const exact = GOOGLE_FONTS.find((g) => g.toLowerCase() === n.replace(/-/g, ' ') || g.toLowerCase() === n);
+    if (exact) return exact;
+    const hit = FONT_MATCH.find(([re]) => re.test(n.replace(/-/g, ' ')));
+    return hit ? hit[1] : null;
+  };
+  let m;
+  const linkRe = /fonts\.googleapis\.com\/css2?\?([^"'\s>]+)/gi;
+  while ((m = linkRe.exec(html)) !== null) {
+    for (const fam of decodeURIComponent(m[1].replace(/&amp;/g, '&')).split('&').filter((p) => /^family=/.test(p)).flatMap((p) => p.slice(7).split('|'))) {
+      add(toGoogle(fam.split(':')[0].replace(/\+/g, ' ')), 5);
+    }
+  }
+  const famRe = /font-family\s*:\s*([^;}{"]{1,200})/gi;
+  while ((m = famRe.exec(css)) !== null) add(toGoogle(m[1].split(',')[0]), 1);
+  const ranked = [...counts].sort((a, b) => b[1] - a[1]).map(([f]) => f).filter((f) => /^[A-Za-z0-9 ]{2,40}$/.test(f));
+  if (!ranked.length) return null;
+  const heading = ranked.find((f) => DISPLAY.has(f)) || ranked[0];
+  const body = ranked.find((f) => f !== heading && !DISPLAY.has(f)) || null;
+  return { heading, body };
+}
+
 const BAD_PHOTO = /(^|[^a-z])(logos?|icons?|sprites?|badges?|avatars?|placeholders?|maps?|buttons?|arrows?|social|payments?|awards?|reviews?|ratings?|stars?|seals?|certified|certification|licen[cs]e[a-z]*|bbb|yelp|angi|homeadvisor|google|facebook|instagram|wordmark|favicon|banners?|qr|menus?|flyers?|coupons?|signature|pixel|spacer|blank|loading)([^a-z]|$)/i;
 
 // Pull brand details out of a fetched homepage. businessName helps recognise the logo image.
@@ -184,10 +265,12 @@ function extractSite(html, pageUrl, businessName) {
   const imgs = scanTags(bare, 'img').map((t) => {
     const a = t.attrs;
     const raw = [a.get('src'), a.get('data-src'), a.get('data-image'), a.get('data-lazy-src'), largestFromSrcset(a.get('srcset') || a.get('data-srcset') || '')].find((u) => u && !/^data:/i.test(u));
-    const url = abs(raw);
+    const url = fullSizeImage(abs(raw));
+    // A builder's thumbnail traded for its original: the tag's width and height are the thumbnail's, so unknown.
+    const swapped = url !== abs(raw);
     const dims = /^(\d+)x(\d+)$/.exec(a.get('data-image-dimensions') || '');
-    const width = dims ? +dims[1] : parseInt(a.get('width') || '', 10) || 0;
-    const height = dims ? +dims[2] : parseInt(a.get('height') || '', 10) || 0;
+    const width = swapped ? 0 : dims ? +dims[1] : parseInt(a.get('width') || '', 10) || 0;
+    const height = swapped ? 0 : dims ? +dims[2] : parseInt(a.get('height') || '', 10) || 0;
     const alt = clean(a.get('alt') || '', 160);
     return { url, width, height, alt, urlAlt: `${url} ${alt}`.toLowerCase(), text: `${raw || ''} ${alt} ${a.get('class') || ''} ${a.get('id') || ''}`.toLowerCase(), header: inHeader(t.index) };
   }).filter((x) => x.url);
@@ -252,6 +335,7 @@ function extractSite(html, pageUrl, businessName) {
   for (const h of links) { const s = socialLink(h); if (s && !socials.has(s.kind)) socials.set(s.kind, s.url); }
 
   const themeColor = parseColor(meta.get('theme-color') || '');
+  const css = cssText(html);
   const description = claimFree(meta.get('description') || meta.get('og:description') || nodes.find((n) => typeof n.description === 'string')?.description || '');
   const types = nodes.flatMap((n) => [].concat(n['@type'] || [])).filter((t) => typeof t === 'string').join(' ');
 
@@ -260,6 +344,8 @@ function extractSite(html, pageUrl, businessName) {
     siteName,
     description,
     themeColor,
+    cssColors: cssColorEntries(css),
+    fonts: siteFonts(html, css),
     logos,
     photos,
     phone: phone ? formatPhone(phone) : null,
