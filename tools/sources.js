@@ -329,6 +329,17 @@ function extractSite(html, pageUrl, businessName) {
     if (ranked.length === 1 || (ranked[0] && ranked[0][1] >= 3 && ranked[0][1] >= 2 * ranked[1][1])) phone = ranked[0][0];
   }
 
+  // Their own pages (same host), with link text, for readPages (D-063).
+  const ownLinks = [];
+  bare.replace(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi, (m, attrs, inner) => {
+    const href = /href\s*=\s*["']([^"']+)["']/i.exec(attrs)?.[1] || '';
+    const u = abs(href);
+    if (u && new URL(u).hostname === base.hostname && !/\.(pdf|jpe?g|png|webp|zip)$/i.test(new URL(u).pathname) && new URL(u).pathname !== new URL(pageUrl).pathname) {
+      const clean1 = u.split('#')[0];
+      if (!ownLinks.some((l) => l.url === clean1) && ownLinks.length < 200) ownLinks.push({ url: clean1, text: clean(decodeEntities(inner.replace(/<[^>]+>/g, ' ')), 80) });
+    }
+    return m;
+  });
   const socials = new Map();
   const links = scanTags(bare, 'a').map((t) => t.attrs.get('href') || '');
   for (const n of nodes) links.push(...[].concat(n.sameAs || []).filter((s) => typeof s === 'string'));
@@ -345,6 +356,9 @@ function extractSite(html, pageUrl, businessName) {
     description,
     themeColor,
     cssColors: cssColorEntries(css),
+    links: ownLinks,
+    paragraphs: pageParagraphs(html).slice(0, 60),
+    blocks: pageBlocks(html),
     fonts: siteFonts(html, css),
     logos,
     photos,
@@ -386,6 +400,93 @@ function socialFromUrl(u) {
   if (host === 'facebook.com' || host === 'fb.com') return { kind: 'facebook', url: url.href };
   if (host === 'instagram.com') return { kind: 'instagram', url: url.href };
   return null;
+}
+
+// ---------- their other pages (D-063) ----------
+// Paragraphs of readable text from a page: <p> and <li> text, tags and scripts stripped, claims dropped.
+function pageParagraphs(html) {
+  const bare = html.replace(/<!--[\s\S]*?-->/g, ' ').replace(/<(script|style|template|nav|header|footer|form)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ');
+  const out = [];
+  bare.replace(/<(p|li)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi, (m, tag, inner) => {
+    const t = clean(decodeEntities(inner.replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, ' ')), 800);
+    if (t.length >= 40 && !/cookie|copyright|all rights reserved|privacy policy|javascript/i.test(t)) out.push(t);
+    return m;
+  });
+  return out;
+}
+// The page's headings, photo labels and paragraphs, in reading order, so a service's text is the paragraphs that
+// follow its heading or photo (D-063).
+function pageBlocks(html) {
+  const bare = html.replace(/<!--[\s\S]*?-->/g, ' ').replace(/<(script|style|template|nav|header|footer|form)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ');
+  const out = [];
+  const re = /<(h[1-6]|p|li)\b[^>]*>([\s\S]*?)<\/\1\s*>|<img\b[^>]*\balt\s*=\s*"([^"]{3,80})"[^>]*>/gi;
+  let m;
+  while ((m = re.exec(bare)) !== null && out.length < 400) {
+    if (m[3]) { out.push({ kind: 'img', text: clean(decodeEntities(m[3]), 80) }); continue; }
+    const t = clean(decodeEntities(m[2].replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, ' ')), 800);
+    if (!t) continue;
+    if (/^h/i.test(m[1])) out.push({ kind: 'head', text: t.slice(0, 120) });
+    else if (t.length >= 40 && !/cookie|copyright|all rights reserved|privacy policy|javascript/i.test(t)) out.push({ kind: 'p', text: t });
+  }
+  return out;
+}
+const words = (s) => String(s).toLowerCase().replace(/&/g, ' and ').split(/[^a-z0-9]+/).filter((w) => w.length > 2 && !['and', 'the', 'our', 'for', 'removal', 'control', 'services', 'service'].includes(w));
+
+// Reads up to 6 of their own pages, same host, same limits and robots rule as the homepage: an About page, a menu
+// page, and a page per service whose link matches the service's name. Returns { about, menuUrl, services: {name: text} }.
+async function readPages(site, { budget, services = [] }) {
+  const out = { about: '', menuUrl: '', services: {} };
+  const links = (site?.links || []).slice(0, 200);
+  // One-page sites (common): the homepage's own paragraphs, the one naming a service for that service, and one
+  // about the business itself for About.
+  const home = site?.paragraphs || [];
+  const blocks = site?.blocks || [];
+  const named = (text, name) => { const want = words(name), have = words(text); return want.length > 0 && want.every((w) => have.includes(w)); };
+  const fromHome = () => {
+    for (const name of services) {
+      if (out.services[name]) continue;
+      // The paragraphs right after its heading (else its photo), until something names another service.
+      let at = blocks.findIndex((b) => b.kind === 'head' && named(b.text, name));
+      const others = services.filter((n) => n !== name);
+      const used = new Set(Object.values(out.services));
+      const after = [];
+      for (let i = at + 1; at >= 0 && i < blocks.length && after.length < 2; i++) {
+        const b = blocks[i];
+        if (b.kind !== 'p') { if (others.some((n) => named(b.text, n)) || (after.length && b.kind === 'head')) break; continue; }
+        if (![...used].some((u) => u.includes(b.text.slice(0, 40)))) after.push(b.text);
+      }
+      const text = after.length ? claimFree(after.join(' '), 520) : '';
+      if (text) out.services[name] = text;
+    }
+    if (!out.about) {
+      const para = home.find((t) => /(we|our|family|owned|owners?|founded|team)/i.test(t) && !Object.values(out.services).includes(claimFree(t, 520)));
+      out.about = para ? claimFree(para, 700) : '';
+    }
+    return out;
+  };
+  if (!links.length) return fromHome();
+  const pick = [];
+  const add = (l, kind, name) => { if (pick.length < 6 && !pick.some((p) => p.url === l.url)) pick.push({ ...l, kind, name }); };
+  const about = links.find((l) => /\b(about|our story|who we are|meet|team)\b/i.test(`${l.text} ${l.url}`));
+  if (about) add(about, 'about');
+  const menu = links.find((l) => /\bmenus?\b/i.test(`${l.text} ${l.url}`));
+  if (menu) out.menuUrl = menu.url;
+  for (const name of services) {
+    const want = words(name);
+    if (!want.length) continue;
+    const hit = links.find((l) => { const have = words(`${l.text} ${decodeURIComponent(new URL(l.url).pathname)}`); return want.some((w) => have.includes(w)); });
+    if (hit) add(hit, 'service', name);
+  }
+  await Promise.all(pick.map(async (p) => {
+    const page = await attempt(`page ${p.kind}`, () => fetchCapped(p.url, { budget, maxBytes: 2 * 1024 * 1024, accept: /^(text\/html|application\/xhtml\+xml)/, headers: { accept: 'text/html,application/xhtml+xml' } }));
+    if (!page) return;
+    const paras = pageParagraphs(page.buffer.toString('utf8'));
+    const text = claimFree(paras.slice(0, 6).join(' '), p.kind === 'about' ? 700 : 520);
+    if (!text) return;
+    if (p.kind === 'about') out.about = text;
+    else if (p.name && !out.services[p.name]) out.services[p.name] = text;
+  }));
+  return fromHome();
 }
 
 async function readSite(siteUrl, { budget, businessName }) {
@@ -464,4 +565,4 @@ async function readPlaces({ name, town, key, fixturePath, budget }) {
   return { ...place, photos: photos.filter(Boolean) };
 }
 
-module.exports = { readPlaces, readSite, extractSite, robotsBlocksAll, namesMatch, claimFree, socialFromUrl, placesFromResponse, decodeEntities, PLACES_FIELDS, PLACES_FIELDS_COARSE };
+module.exports = { readPlaces, readSite, readPages, pageParagraphs, extractSite, robotsBlocksAll, namesMatch, claimFree, socialFromUrl, placesFromResponse, decodeEntities, PLACES_FIELDS, PLACES_FIELDS_COARSE };
