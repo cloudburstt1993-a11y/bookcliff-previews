@@ -16,7 +16,7 @@ on:
         default: Grand Junction
         type: string
       trade:
-        description: "Trade: cleaning, hauling, construction, salon, health, auto, landscaping, professional, general (blank to guess)"
+        description: "Trade: cleaning, hauling, construction, salon, health, auto, landscaping, professional, food, general (blank to guess)"
         required: false
         default: ""
         type: string
