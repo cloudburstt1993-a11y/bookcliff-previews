@@ -10,7 +10,7 @@
 //        [--lead-url https://...] [--request <portal id>] \
 //        [--site https://their-site.com | https://facebook.com/page | https://instagram.com/name] \
 //        [--logo https://.../logo.png] [--photos "url1,url2" (or one per line, at most 6)] \
-//        [--places-fixture saved-places.json]
+//        [--places-fixture saved-places.json] [--social "facebook/instagram URL (one per line)"] [--details JSON]
 //   Env: GOOGLE_PLACES_API_KEY (optional), PREVIEW_LEAD_URL (default for --lead-url).
 //   Setup: `npm ci` in ops/previews installs sharp (pinned in package-lock.json). Without it the build
 //   still runs, minus the logo and image-derived colors.
@@ -66,7 +66,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const TRADES = require('./trades');
 const { createBudget, httpUrl, fetchCapped, attempt } = require('./net');
-const { readPlaces, readSite, socialFromUrl } = require('./sources');
+const { readPlaces, readSite, socialFromUrl, claimFree } = require('./sources');
 const { loadLogo, photoColorEntries } = require('./brand');
 const C = require('./colors');
 const ART = require('./art');
@@ -147,7 +147,7 @@ async function main() {
   const town = opt('--town', 'Grand Junction');
   const SAMPLE = args.includes('--sample');
   if (SAMPLE) {
-    const outside = ['--site', '--logo', '--photos', '--places-fixture', '--lead-url', '--phone', '--request'].filter((k) => args.includes(k));
+    const outside = ['--site', '--logo', '--photos', '--places-fixture', '--lead-url', '--phone', '--request', '--social', '--details'].filter((k) => args.includes(k));
     if (outside.length) { console.error(`--sample is for made-up businesses and takes no outside source: drop ${outside.join(', ')}`); process.exit(1); }
   }
   if (args.includes('--sample-photos') && !SAMPLE) { console.error('--sample-photos is for --sample builds only'); process.exit(1); }
@@ -197,6 +197,26 @@ async function main() {
   if (socialSite) socials[socialSite.kind] = socialSite.url;
   else if (siteArg) site = await attempt('website', () => readSite(siteArg, { budget, businessName: name }));
   for (const [k, v] of Object.entries(site?.socials || {})) if (!socials[k]) socials[k] = v;
+  // --social: their Facebook page or Instagram profile, one per line, found by the portal's lookup (D-060).
+  // Linked only ("Find us on Facebook"), never fetched; their own website's links win.
+  // --details: what the portal's lookup read about them (D-060), as JSON: { social: [urls], services: [names],
+  // about: "..." }. Their own website's words win; claim sentences and claim-like service names are dropped.
+  const details = (() => {
+    try {
+      const d = JSON.parse(String(opt('--details', '') || '{}'));
+      return d && typeof d === 'object' && !Array.isArray(d) ? d : {};
+    } catch {
+      return {};
+    }
+  })();
+  const strList = (v, n) => (Array.isArray(v) ? v : []).slice(0, n).map((x) => String(x ?? '').replace(/\s+/g, ' ').trim());
+  for (const line of [...String(opt('--social', '')).split(/\r?\n/), ...strList(details.social, 4)].slice(0, 6)) {
+    const s = socialFromUrl(line.trim());
+    if (s && !socials[s.kind]) socials[s.kind] = s.url;
+  }
+  const CLAIMISH = /\$|\d\s*(stars?|%)|\b(best|free|cheap|#\s*1|rated|award|licen[cs]|certified|insured|guarantee|top)\b/i;
+  const theirServices = strList(details.services, 6).filter((s) => s.length >= 3 && s.length <= 60 && !CLAIMISH.test(s));
+  const lookedUpAbout = claimFree(String(details.about ?? '').slice(0, 600), 360);
 
   const logoCandidates = [];
   const ownerLogo = httpUrl(opt('--logo', ''));
@@ -232,8 +252,8 @@ async function main() {
   const tradeKey = tradeFlag || findTrade(rawName) || [places?.category, ...(site?.tradeHints || [])].map(findTrade).find(Boolean) || 'general';
   const T = TRADES[tradeKey];
   const phone = phoneArg || places?.phone || site?.phone || '';
-  const description = places?.summary || site?.description || '';
-  const descriptionFrom = places?.summary ? 'google' : site?.description ? 'site' : '';
+  const description = places?.summary || site?.description || lookedUpAbout || '';
+  const descriptionFrom = places?.summary ? 'google' : site?.description ? 'site' : lookedUpAbout ? 'lookup' : '';
   const hours = places && places.status !== 'CLOSED_PERMANENTLY' ? places.hours : [];
   const category = T.label || ''; // never Google's category text on the page (see above)
 
@@ -298,8 +318,11 @@ async function main() {
   if (site?.familyOwned) trust.push(`<li>${icon('home')}<span><strong>Family owned</strong><small>Local business</small></span></li>`);
   const trustHtml = trust.length >= 2 ? `<div class="wrap"><ul class="trust" aria-label="At a glance">${trust.join('')}</ul></div>` : '';
 
-  const services = T.services.map(([h, p], i) => `<li data-reveal><span class="num" aria-hidden="true">${String(i + 1).padStart(2, '0')}</span><h3>${esc(h)}</h3><p>${esc(p)}</p></li>`).join('');
-  const options = T.services.map(([h]) => `<option>${esc(h)}</option>`).join('');
+  // Their own services when the lookup found at least 3 on their website (D-060); otherwise the trade's samples.
+  const ownServices = theirServices.length >= 3;
+  const serviceList = ownServices ? theirServices.map((h) => [h, '']) : T.services;
+  const services = serviceList.map(([h, p], i) => `<li data-reveal><span class="num" aria-hidden="true">${String(i + 1).padStart(2, '0')}</span><h3>${esc(h)}</h3>${p ? `<p>${esc(p)}</p>` : ''}</li>`).join('');
+  const options = serviceList.map(([h]) => `<option>${esc(h)}</option>`).join('');
   const steps = T.steps.map((s, i) => `<li><span aria-hidden="true">${i + 1}</span>${esc(s)}</li>`).join('');
 
   const gallery = rest.length >= 2 ? rest : [];
@@ -324,7 +347,7 @@ ${places?.mapsUri && sources.has('google') ? `<p class="fine"><a href="${esc(pla
   const socialHtml = Object.entries(socials).map(([k, u]) => `<a class="social" href="${esc(u)}" rel="noopener">${icon(k)}Find us on ${k === 'facebook' ? 'Facebook' : 'Instagram'}</a>`).join('');
   const siteHost = site ? new URL(site.url).hostname.replace(/^www\./, '') : '';
   const aboutText = description
-    ? `<p class="about-text">${esc(description)}</p><p class="src">${descriptionFrom === 'google' ? `Summary from ${googleMark}` : `In their words, from ${esc(siteHost)}`}</p>`
+    ? `<p class="about-text">${esc(description)}</p><p class="src">${descriptionFrom === 'google' ? `Summary from ${googleMark}` : descriptionFrom === 'lookup' ? 'From a look at their website and listings' : `In their words, from ${esc(siteHost)}`}</p>`
     : `<p class="about-text">This is where ${esc(name)}'s story goes: how it started, who does the work and what makes it different. <span class="tag">sample</span></p>`;
   // No photo of their own: our illustrations (art.js) fill the hero and the About section instead (D-051).
   const scene = ART.sceneFor(tradeKey);
@@ -554,7 +577,9 @@ ${logo ? '<link rel="icon" href="logo.png">\n' : ''}<title>${esc(name)} (${SAMPL
 ${heroHtml}
 ${trustHtml}
 <section id="services" class="sec" aria-labelledby="services-h"><div class="wrap">
-<div class="sec-head" data-reveal><p class="kicker">Services <span class="tag">sample</span></p><h2 id="services-h">${esc(T.headline(name, town))}</h2><p class="lead">Typical ${esc(T.noun)} services. On the real site, these are ${esc(name)}'s own, in their own words.</p></div>
+<div class="sec-head" data-reveal>${ownServices
+    ? `<p class="kicker">Services</p><h2 id="services-h">${esc(T.headline(name, town))}</h2><p class="lead">What ${esc(name)} offers, from their own website.</p>`
+    : `<p class="kicker">Services <span class="tag">sample</span></p><h2 id="services-h">${esc(T.headline(name, town))}</h2><p class="lead">Typical ${esc(T.noun)} services. On the real site, these are ${esc(name)}'s own, in their own words.</p>`}</div>
 <ul class="svc">${services}</ul></div></section>
 ${galleryHtml}
 ${aboutHtml}

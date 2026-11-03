@@ -45,6 +45,11 @@ on:
         required: false
         default: ""
         type: string
+      details:
+        description: "What the portal's lookup found, as JSON: social pages to link, their services, a short description (D-060)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -71,6 +76,7 @@ jobs:
           SITE: ${{ inputs.site }}
           LOGO: ${{ inputs.logo }}
           PHOTOS: ${{ inputs.photos }}
+          DETAILS: ${{ inputs.details }}
           # Google Places API (New), for the business's Google listing details and photos. Optional:
           # without it the builder uses their website and the links given (D-044).
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
@@ -83,6 +89,7 @@ jobs:
           if [ -n "$SITE" ]; then args+=(--site "$SITE"); fi
           if [ -n "$LOGO" ]; then args+=(--logo "$LOGO"); fi
           if [ -n "$PHOTOS" ]; then args+=(--photos "$PHOTOS"); fi
+          if [ -n "$DETAILS" ]; then args+=(--details "$DETAILS"); fi
           node tools/build-preview.js "${args[@]}"
       - name: Publish
         env:
