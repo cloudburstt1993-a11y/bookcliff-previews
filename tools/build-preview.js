@@ -267,17 +267,23 @@ async function main() {
   const photoServices = servicePhotos.length >= 3 ? servicePhotos.slice(0, 6) : [];
   const teamPhoto = sp.length ? null : photos.find((p) => labelled(p) && ABOUT_ALT.test(p.alt)) || null;
   const free = photos.filter((p) => !photoServices.includes(p) && p !== teamPhoto);
-  // A full-width photo hero needs a sharp, wide photo (1100 px or more). With 2 or more of those and 4+ photos, it
-  // rotates; with one, the business's name picks the layout (full photo or split with a framed photo), so previews
-  // don't all look alike; a smaller photo is always framed, never stretched.
+  // Three hero styles, picked by the business's name so previews don't all look alike (D-061, D-062):
+  //   full:  a sharp, wide photo (1100 px or more) across the hero, slowly zooming; 2+ of those with 4+ photos rotate;
+  //   split: the photo framed beside the headline on a band of their brand color (also any photo too small for full);
+  //   faded: their photos as a soft, faded background washed in their brand color, rotating when there are 2 or 3.
+  //          Fading hides softness, so photos from 700 px qualify.
   const big = (p) => (p.width >= 1100 || (!p.measured && !p.width)) && p.width / (p.height || 1) >= 1.15 && p.width / (p.height || 1) <= 2.6;
   const bigOnes = free.filter(big);
+  const nameHash = [...slugBase].reduce((a, ch) => (a * 31 + ch.charCodeAt(0)) >>> 0, 7);
+  const fadeOnes = free.filter((p) => p.width >= 700 && p.width / (p.height || 1) >= 1);
+  const faded = !sp.length && nameHash % 3 === 2 && fadeOnes.length >= 1;
   const heroCount = photos.length >= 5 ? 3 : photos.length >= 4 ? 2 : 1;
-  const prospectHeroes = heroCount > 1 && bigOnes.length >= heroCount ? bigOnes.slice(0, heroCount) : bigOnes.length ? [bigOnes[0]] : free.length ? [free[0]] : [];
+  const prospectHeroes = faded
+    ? fadeOnes.slice(0, Math.max(1, Math.min(3, fadeOnes.length, photos.length >= 3 ? 3 : 1)))
+    : heroCount > 1 && bigOnes.length >= heroCount ? bigOnes.slice(0, heroCount) : bigOnes.length ? [bigOnes[0]] : free.length ? [free[0]] : [];
   const heroes = sp.length ? sp.filter((p) => p.role === 'hero') : prospectHeroes;
   const hero = heroes[0] || null;
-  const nameHash = [...slugBase].reduce((a, ch) => (a * 31 + ch.charCodeAt(0)) >>> 0, 7);
-  const split = !sp.length && heroes.length === 1 && hero && (!big(hero) || nameHash % 2 === 1);
+  const split = !faded && !sp.length && heroes.length === 1 && hero && (!big(hero) || nameHash % 3 === 1);
   const rest = sp.length ? sp.filter((p) => p.role === 'gallery') : free.filter((p) => !heroes.includes(p));
 
   // ---------- trade, facts, palette ----------
@@ -424,7 +430,7 @@ ${heroCopy}
 ${ART.ridge()}
 </section>`
     : hero
-    ? `<section class="hero has-photo${slides ? ' has-slides' : ' has-zoom'}${bwSlides ? ' slides-bw' : ''}" aria-labelledby="h1">
+    ? `<section class="hero has-photo${slides ? ' has-slides' : ' has-zoom'}${bwSlides ? ' slides-bw' : ''}${faded ? ' has-faded' : ''}" aria-labelledby="h1">
 <div class="hero-media${slides ? ' hero-slides' : ''}">${slides ? heroes.map((p, i) => {
     // Every slide loads at once (a hidden lazy image may never be fetched); only the first is urgent. Each is its
     // own data-photo, so one that fails to load is dropped alone.
@@ -488,6 +494,9 @@ ${heroes.map((_, i) => `.hero-slides img:nth-child(${i + 1}){animation-delay:${i
 .svc li.svc-photo{display:block;padding:0}.svc-photo figure{margin:0;aspect-ratio:4/3;overflow:hidden;background:var(--line)}
 .svc-photo img{width:100%;height:100%;object-fit:cover;aspect-ratio:4/3;transition:transform .8s cubic-bezier(.2,.7,.2,1)}.svc-photo:hover img{transform:scale(1.05)}
 .svc-photo h3{padding:16px 20px 4px}.svc-photo p{padding:0 20px 18px}.svc-photo h3:last-child{padding-bottom:20px}
+.has-faded{background:var(--band);background:linear-gradient(160deg,var(--band),color-mix(in srgb,var(--band) 70%,var(--btn)))}
+.has-faded .hero-media{opacity:.36;filter:grayscale(.6) contrast(1.05);mix-blend-mode:luminosity}
+.hero.has-faded::before{background:var(--overlay);background:linear-gradient(90deg,color-mix(in srgb,var(--band) 82%,transparent) 0%,color-mix(in srgb,var(--band) 45%,transparent) 75%,color-mix(in srgb,var(--band) 30%,transparent) 100%)}
 ${fonts ? `h1,h2,h3,.brand-name,.foot-name,.btn{font-family:"${fonts.heading}",system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}${fonts.body ? `body{font-family:"${fonts.body}",system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}` : ''}${SINGLE_WEIGHT.has(fonts.heading) || /Oswald|Teko|Barlow Condensed/.test(fonts.heading) ? 'h1,h2{letter-spacing:.01em;font-weight:600}' : ''}` : ''}`;
   const ov = tokens.overlay, a = tokens.overlayAlpha;
   const css = `
