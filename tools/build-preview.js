@@ -495,7 +495,7 @@ ${heroes.map((_, i) => `.hero-slides img:nth-child(${i + 1}){animation-delay:${i
 .svc-photo img{width:100%;height:100%;object-fit:cover;aspect-ratio:4/3;transition:transform .8s cubic-bezier(.2,.7,.2,1)}.svc-photo:hover img{transform:scale(1.05)}
 .svc-photo h3{padding:16px 20px 4px}.svc-photo p{padding:0 20px 18px}.svc-photo h3:last-child{padding-bottom:20px}
 .page-hero{position:relative;overflow:hidden;color:#fff;background:var(--band);background:radial-gradient(110% 90% at 100% 0%,var(--glow),transparent 60%),linear-gradient(160deg,var(--band),color-mix(in srgb,var(--band) 75%,var(--btn)))}
-.page-hero .wrap{position:relative;z-index:1;padding-top:52px;padding-bottom:clamp(64px,9vw,104px)}.page-hero h1{font-size:clamp(32px,7vw,56px);margin:10px 0 12px;max-width:20ch}
+.page-hero .wrap{position:relative;z-index:1;padding-top:52px;padding-bottom:56px}.page-hero.has-photo{display:flex;align-items:flex-end;min-height:clamp(280px,46vh,460px)}.page-hero.has-photo .wrap{width:100%;padding-top:72px;padding-bottom:64px}.page-hero h1{font-size:clamp(32px,7vw,56px);margin:10px 0 12px;max-width:20ch}
 .mnav{display:flex;gap:6px;overflow-x:auto;padding:8px 20px 10px;border-top:1px solid var(--line);scrollbar-width:none}.mnav::-webkit-scrollbar{display:none}
 .mnav a{white-space:nowrap;padding:7px 14px;border-radius:999px;border:1px solid var(--line);color:inherit;text-decoration:none;font-weight:600;font-size:14px}
 .mnav a[aria-current],nav.main a[aria-current]{color:var(--btn-ink);background:var(--btn);border-color:var(--btn);opacity:1;text-decoration:none}nav.main a[aria-current]{padding:6px 12px;border-radius:999px}
@@ -730,7 +730,14 @@ ${SAMPLE
       ['about.html', 'About'], ['contact.html', contactName]];
     const navFor = (pre, here) => navItems.map(([href, t]) => `<a href="${pre}${href}"${href === here ? ' aria-current="page"' : ''}>${esc(t)}</a>`).join('');
     const sample = '<span class="tag">sample</span>';
-    const pageHead = (kicker, title, lead) => `<section class="page-hero"><div class="wrap"><p class="eyebrow">${kicker}</p><h1 id="h1">${title}</h1>${lead ? `<p class="hero-sub">${lead}</p>` : ''}</div>${ART.ridge()}</section>`;
+    // Inner pages open like the home page (D-064): one of their own photos as a faded background washed in their brand
+    // color, slowly zooming; a different photo per page where they have enough. Only with no usable photo at all is
+    // it a plain brand-color band.
+    const pool = [...new Set([...heroes, ...allPhotos, ...(aboutPhoto ? [aboutPhoto] : [])])];
+    const pick = (n) => (pool.length ? pool[n % pool.length] : null);
+    const pageHead = (kicker, title, lead, photo = null) => photo
+      ? `<section class="hero page-hero has-photo has-faded has-zoom"><div class="hero-media">${img(photo, 0, { sizes: '100vw', lazy: false }).replace(/ alt="[^"]*"/, ' alt=""')}</div><div class="wrap"><p class="eyebrow">${kicker}</p><h1 id="h1">${title}</h1>${lead ? `<p class="hero-sub">${lead}</p>` : ''}</div></section>`
+      : `<section class="page-hero"><div class="wrap"><p class="eyebrow">${kicker}</p><h1 id="h1">${title}</h1>${lead ? `<p class="hero-sub">${lead}</p>` : ''}</div></section>`;
     const ctaBand = (pre) => `<section class="cta-band"><div class="wrap cta-inner" data-reveal><div><h2>${esc(T.cta)}</h2><p>${phone ? `Call <a href="${esc(telHref(phone))}">${esc(phone)}</a>, or send` : 'Send'} a message and get a reply fast.</p></div><a class="btn btn-main" href="${pre}contact.html">${esc(contactName)}${icon('arrow')}</a></div></section>`;
     const card = (s, pre, i) => `<li data-reveal${s.photo ? ' class="svc-photo"' : ''}><a class="card-link" href="${pre}services/${s.slug}.html">${s.photo ? `<figure>${img(s.photo, i + 1, { sizes: '(min-width: 760px) 30vw, 100vw', lazy: true }).replace(/ alt="[^"]*"/, ' alt=""')}</figure>` : `<span class="num" aria-hidden="true">${String(i + 1).padStart(2, '0')}</span>`}<h3>${esc(s.name)}</h3><span class="more">Learn more${icon('arrow')}</span></a></li>`;
     const serviceCards = (pre) => real.length ? real.map((s, i) => card(s, pre, i)).join('') : services;
@@ -764,12 +771,12 @@ ${hasGallery ? `<section class="sec" aria-labelledby="photos-h"><div class="wrap
 <ul class="gallery">${allPhotos.slice(0, 3).map((p, i) => fig(p, i, '(min-width: 760px) 34vw, 50vw')).join('')}</ul><p class="fine"><a href="gallery.html">See all ${esc(galleryName.toLowerCase())}</a></p></div></section>` : ''}
 ${ctaBand('')}`;
     pages = { 'index.html': page('Home', home, 'index.html') };
-    pages['services.html'] = page('Services', `${pageHead('Services', esc(T.headline(name, town)), real.length ? `What ${esc(name)} offers, from their own website.` : `Typical ${esc(T.noun)} services ${sample}`)}
+    pages['services.html'] = page('Services', `${pageHead('Services', esc(T.headline(name, town)), real.length ? `What ${esc(name)} offers, from their own website.` : `Typical ${esc(T.noun)} services ${sample}`, pick(0))}
 <section class="sec"><div class="wrap">${KIND === 'food' && more.menuUrl ? `<p data-reveal><a class="btn btn-main" href="${esc(more.menuUrl)}" rel="noopener">See their current menu${icon('arrow')}</a></p>` : ''}<ul class="svc">${serviceCards('')}</ul></div></section>
 ${ctaBand('')}`, 'services.html');
     for (const s of real) {
       const others = real.filter((o) => o !== s).map((o) => `<li><a href="${o.slug}.html">${esc(o.name)}</a></li>`).join('');
-      pages[`services/${s.slug}.html`] = page(s.name, `${pageHead(`Services · ${esc(town)}`, esc(s.name), '')}
+      pages[`services/${s.slug}.html`] = page(s.name, `${pageHead(`Services · ${esc(town)}`, esc(s.name), '', s.photo || pick(real.indexOf(s) + 1))}
 <section class="sec"><div class="wrap svc-detail${s.photo ? ' has-photo' : ''}">
 <div data-reveal>${s.text ? `<p class="about-text">${esc(s.text)}</p><p class="src">In their words, from their website</p>` : `<p class="about-text">${esc(s.name)} from ${esc(name)} in ${esc(town)}, Colorado. On the real site, this page explains how they handle it, in their own words. ${sample}</p>`}
 <p><a class="btn btn-main" href="../contact.html">${esc(contactName)}${icon('arrow')}</a></p>${others ? `<h2 class="small-h">Other services</h2><ul class="links">${others}</ul>` : ''}</div>
@@ -779,23 +786,23 @@ ${ctaBand('../')}`, 'services.html', '../');
     }
     if (KIND === 'build') {
       const towns = ['Grand Junction', 'Fruita', 'Palisade', 'Clifton', 'Orchard Mesa', 'Redlands', 'Whitewater', 'Loma', 'Mack'];
-      pages['service-area.html'] = page('Service area', `${pageHead('Service area', `Serving ${esc(town)} and the Grand Valley`, `Typical service area ${sample} On the real site, these are the towns ${esc(name)} covers.`)}
+      pages['service-area.html'] = page('Service area', `${pageHead('Service area', `Serving ${esc(town)} and the Grand Valley`, `Typical service area ${sample} On the real site, these are the towns ${esc(name)} covers.`, pick(1))}
 <section class="sec"><div class="wrap"><ul class="towns">${[town, ...towns.filter((t) => t !== town)].map((t) => `<li data-reveal>${icon('pin')}${esc(t)}</li>`).join('')}</ul></div></section>
 ${ctaBand('')}`, 'service-area.html');
     }
     if (hasGallery) {
-      pages['gallery.html'] = page(galleryName, `${pageHead(esc(galleryName), `A look at ${esc(name)}`, `Photos from ${esc(name)}'s own website.`)}
+      pages['gallery.html'] = page(galleryName, `${pageHead(esc(galleryName), `A look at ${esc(name)}`, `Photos from ${esc(name)}'s own website.`, allPhotos[0] || pick(2))}
 <section class="sec"><div class="wrap"><ul class="gallery">${allPhotos.map((p, i) => fig(p, i, '(min-width: 760px) 34vw, 50vw')).join('')}</ul></div></section>
 ${ctaBand('')}`, 'gallery.html');
     }
-    pages['about.html'] = page('About', `${pageHead('About', `About ${esc(name)}`, '')}
+    pages['about.html'] = page('About', `${pageHead('About', `About ${esc(name)}`, '', aboutPhoto || pick(2))}
 <section class="sec"><div class="wrap about${aboutPhoto ? ' has-photo' : ' has-art'}">
 <div data-reveal>${aboutWords ? `<p class="about-text">${esc(aboutWords)}</p><p class="src">${aboutFrom}</p>` : `<p class="about-text">This is where ${esc(name)}'s story goes: how it started, who does the work and what makes it different. ${sample}</p>`}${socialHtml ? `<div class="socials">${socialHtml}</div>` : ''}</div>
 ${aboutPhoto ? `<figure class="about-photo" data-photo data-reveal>${img(aboutPhoto, 1, { sizes: '(min-width: 760px) 45vw, 100vw', lazy: false })}</figure>` : `<div class="about-art">${ART.aboutArt(scene)}</div>`}
 </div></section>
 ${hoursHtml}
 ${ctaBand('')}`, 'about.html');
-    pages['contact.html'] = page(contactName, `${pageHead(esc(contactName), esc(T.cta), 'Send a message and get a personal reply by email within a minute, any time of day.')}
+    pages['contact.html'] = page(contactName, `${pageHead(esc(contactName), esc(T.cta), 'Send a message and get a personal reply by email within a minute, any time of day.', pick(3))}
 ${KIND === 'book' ? contactSections : contactSections.replace(/<section id="book"[\s\S]*?<\/section>\n?/, (m) => '').concat(contactSections.match(/<section id="book"[\s\S]*?<\/section>/)?.[0] || '')}`, 'contact.html');
   }
 
