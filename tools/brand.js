@@ -90,4 +90,14 @@ async function photoColorEntries(url, { budget }) {
   return (await samplePixels(res.buffer)).entries;
 }
 
-module.exports = { loadLogo, photoColorEntries, hasSharp: () => Boolean(sharp) };
+// A photo's real size (D-061): pages often show a big photo as a small thumbnail, or a tiny blurred placeholder,
+// so the HTML's width and height can't be trusted.
+async function imageSize(url, { budget }) {
+  if (!sharp) return null;
+  const res = await fetchCapped(url, { budget, maxBytes: IMAGE_BYTES, accept: /^image\// });
+  if (looksSvg(res.buffer, res.contentType)) return null;
+  const meta = await sharp(res.buffer, { limitInputPixels: PIXEL_LIMIT }).metadata();
+  return meta.width && meta.height ? { width: meta.width, height: meta.height } : null;
+}
+
+module.exports = { loadLogo, photoColorEntries, imageSize, hasSharp: () => Boolean(sharp) };
