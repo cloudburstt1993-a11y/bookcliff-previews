@@ -66,7 +66,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const TRADES = require('./trades');
 const { createBudget, httpUrl, fetchCapped, attempt } = require('./net');
-const { readPlaces, readSite, socialFromUrl, claimFree } = require('./sources');
+const { readPlaces, readSite, readPages, socialFromUrl, claimFree } = require('./sources');
 const { loadLogo, photoColorEntries, imageSize, hasSharp } = require('./brand');
 const C = require('./colors');
 const ART = require('./art');
@@ -494,6 +494,19 @@ ${heroes.map((_, i) => `.hero-slides img:nth-child(${i + 1}){animation-delay:${i
 .svc li.svc-photo{display:block;padding:0}.svc-photo figure{margin:0;aspect-ratio:4/3;overflow:hidden;background:var(--line)}
 .svc-photo img{width:100%;height:100%;object-fit:cover;aspect-ratio:4/3;transition:transform .8s cubic-bezier(.2,.7,.2,1)}.svc-photo:hover img{transform:scale(1.05)}
 .svc-photo h3{padding:16px 20px 4px}.svc-photo p{padding:0 20px 18px}.svc-photo h3:last-child{padding-bottom:20px}
+.page-hero{position:relative;overflow:hidden;color:#fff;background:var(--band);background:radial-gradient(110% 90% at 100% 0%,var(--glow),transparent 60%),linear-gradient(160deg,var(--band),color-mix(in srgb,var(--band) 75%,var(--btn)))}
+.page-hero .wrap{position:relative;z-index:1;padding-top:52px;padding-bottom:clamp(64px,9vw,104px)}.page-hero h1{font-size:clamp(32px,7vw,56px);margin:10px 0 12px;max-width:20ch}
+.mnav{display:flex;gap:6px;overflow-x:auto;padding:8px 20px 10px;border-top:1px solid var(--line);scrollbar-width:none}.mnav::-webkit-scrollbar{display:none}
+.mnav a{white-space:nowrap;padding:7px 14px;border-radius:999px;border:1px solid var(--line);color:inherit;text-decoration:none;font-weight:600;font-size:14px}
+.mnav a[aria-current],nav.main a[aria-current]{color:var(--btn-ink);background:var(--btn);border-color:var(--btn);opacity:1;text-decoration:none}nav.main a[aria-current]{padding:6px 12px;border-radius:999px}
+@media(min-width:900px){.mnav{display:none}}
+.card-link{display:contents;color:inherit;text-decoration:none}.svc .more{grid-column:2;display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:14px;color:var(--link)}.svc-photo .more{padding:0 20px 18px}.svc li:has(.card-link):hover h3{text-decoration:underline}
+.cta-band{background:var(--band);color:var(--on-band);padding:48px 0}.cta-inner{display:flex;flex-wrap:wrap;gap:20px;align-items:center;justify-content:space-between}.cta-band h2{margin:0 0 6px}.cta-band p{margin:0;color:var(--on-band-muted)}.cta-band a:not(.btn){color:var(--band-link)}
+.svc-detail{display:grid;gap:36px;align-items:start}@media(min-width:900px){.svc-detail.has-photo{grid-template-columns:1.1fr .9fr}}.small-h{font-size:18px;margin:28px 0 8px}.links{margin:0;padding-left:18px}.links li{margin:4px 0}
+.towns{list-style:none;margin:0;padding:0;display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}.towns li{display:flex;gap:10px;align-items:center;padding:14px 16px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);font-weight:700}.towns .ic{color:var(--accent)}
+.r-sharp{--r:8px}.r-sharp .btn,.r-sharp .mnav a,.r-sharp nav.main a[aria-current]{border-radius:10px}.r-sharp .split-photo img,.r-sharp .split-photo::before{border-radius:10px}.r-round{--r:28px}
+.hdr-brand header.site{background:var(--band);color:var(--on-band);border-bottom-color:transparent}.hdr-brand .mnav{border-top-color:rgba(255,255,255,.14)}.hdr-brand .mnav a{border-color:rgba(255,255,255,.28)}
+.cards-line .svc li{box-shadow:none;border-width:2px}.cards-line .svc li::before{height:0}
 .has-faded{background:var(--band);background:linear-gradient(160deg,var(--band),color-mix(in srgb,var(--band) 70%,var(--btn)))}
 .has-faded .hero-media{opacity:.36;filter:grayscale(.6) contrast(1.05);mix-blend-mode:luminosity}
 .hero.has-faded::before{background:var(--overlay);background:linear-gradient(90deg,color-mix(in srgb,var(--band) 82%,transparent) 0%,color-mix(in srgb,var(--band) 45%,transparent) 75%,color-mix(in srgb,var(--band) 30%,transparent) 100%)}
@@ -607,7 +620,7 @@ document.querySelectorAll('img[data-ext]').forEach(i=>{const gone=()=>{const p=i
 if(!matchMedia('(prefers-reduced-motion: reduce)').matches&&'IntersectionObserver' in window){const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{rootMargin:'0px 0px -8% 0px'});
 document.querySelectorAll('[data-reveal]').forEach(el=>{if(el.getBoundingClientRect().top>innerHeight*.9){el.classList.add('rv');io.observe(el)}})}
 const f=document.getElementById('lead'),ok=document.getElementById('ok');
-f.addEventListener('submit',e=>{e.preventDefault();const d=new FormData(f),em=String(d.get('email')||'').trim();
+if(f){f.addEventListener('submit',e=>{e.preventDefault();const d=new FormData(f),em=String(d.get('email')||'').trim();
 if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(em)){f.email.focus();f.email.setCustomValidity('Enter an email address');f.email.reportValidity();return}f.email.setCustomValidity('');
 const first=String(d.get('name')||'').trim().split(/\\s+/)[0];
 if(LEAD){const b=new URLSearchParams();['name','email','phone','service','message','_gotcha'].forEach(k=>{const v=d.get(k);if(v)b.append(k,String(v).slice(0,1000))});b.append('preview',SLUG);b.append('page',location.pathname);
@@ -616,15 +629,15 @@ document.getElementById('okmsg').textContent='Check your inbox: a personal reply
 else{document.getElementById('okmsg').textContent=${JSON.stringify(SAMPLE ? 'On a real site, the customer gets a personal reply by email within a minute. This sample sends nothing.' : 'On the live site, a personal reply lands in this inbox within a minute. (The preview reply is being switched on.)')}}
 document.getElementById('okname').textContent=first?', '+first:'';f.hidden=true;ok.classList.add('show');ok.focus()});
 f.email.addEventListener('input',()=>f.email.setCustomValidity(''));
-document.getElementById('again').onclick=()=>{f.reset();f.hidden=false;ok.classList.remove('show');f.querySelector('input').focus()};
+document.getElementById('again').onclick=()=>{f.reset();f.hidden=false;ok.classList.remove('show');f.querySelector('input').focus()}}
 const slots=[...document.querySelectorAll('.slots button')];let pick=null;
 slots.forEach(s=>s.onclick=()=>{slots.forEach(x=>x.setAttribute('aria-pressed','false'));s.setAttribute('aria-pressed','true');pick=s.textContent});
-document.getElementById('bookbtn').onclick=()=>{document.getElementById('bookmsg').textContent=pick?'Booked for '+pick+'. On the live site this goes on the calendar and the customer gets a confirmation and a reminder.':'Pick a time first.'};
+const bb=document.getElementById('bookbtn');if(bb)bb.onclick=()=>{document.getElementById('bookmsg').textContent=pick?'Booked for '+pick+'. On the live site this goes on the calendar and the customer gets a confirmation and a reminder.':'Pick a time first.'};
 })();
 `;
   const scriptHash = crypto.createHash('sha256').update(script).digest('base64');
   const csp = [
-    "default-src 'none'", "img-src 'self' https:", `style-src 'unsafe-inline'${fontsHref ? ' https://fonts.googleapis.com' : ''}`, `script-src 'sha256-${scriptHash}'`,
+    "default-src 'none'", "img-src 'self' https:", `style-src 'self' 'unsafe-inline'${fontsHref ? ' https://fonts.googleapis.com' : ''}`, `script-src 'sha256-${scriptHash}'`,
     ...(fontsHref ? ['font-src https://fonts.gstatic.com'] : []),
     `connect-src ${LEAD_URL ? new URL(LEAD_URL).origin : "'none'"}`, "base-uri 'none'", "form-action 'none'",
   ].join('; ');
@@ -698,8 +711,105 @@ ${SAMPLE
 </html>
 `;
 
+  // ---------- a multi-page site for prospects (D-063) ----------
+  // Shaped by the kind of business: home, services (a page per real service), the trade's own pages (service area and
+  // projects for builders, menu and photos for food, booking for salons), gallery, about and contact. One stylesheet;
+  // the same banner, noindex and CSP on every page. Samples stay one page.
+  let pages = null;
+  if (!SAMPLE) {
+    const more = site ? (await attempt('their other pages', () => readPages(site, { budget, services: serviceList.map(([h]) => h) }))) || {} : {};
+    const KIND = ['construction', 'hauling', 'landscaping'].includes(tradeKey) ? 'build' : tradeKey === 'food' ? 'food' : ['salon', 'health'].includes(tradeKey) ? 'book' : 'general';
+    const slugify = (t) => String(t).toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'service';
+    const real = ownServices ? serviceList.map(([h, , ph]) => ({ name: h, slug: slugify(h), photo: ph, text: more.services?.[h] || '' })) : [];
+    const contactName = KIND === 'build' ? 'Free estimate' : KIND === 'book' ? 'Book' : KIND === 'food' ? 'Visit & contact' : 'Contact';
+    const allPhotos = [...new Set([...rest, ...photoServices, ...(teamPhoto ? [teamPhoto] : []), ...(heroes.length > 1 ? heroes.slice(1) : [])])];
+    const hasGallery = allPhotos.length >= 3;
+    const galleryName = KIND === 'build' ? 'Projects' : KIND === 'food' ? 'Photos' : 'Gallery';
+    const navItems = [['index.html', 'Home'], ['services.html', KIND === 'food' ? 'Menu & more' : 'Services'],
+      ...(KIND === 'build' ? [['service-area.html', 'Service area']] : []), ...(hasGallery ? [['gallery.html', galleryName]] : []),
+      ['about.html', 'About'], ['contact.html', contactName]];
+    const navFor = (pre, here) => navItems.map(([href, t]) => `<a href="${pre}${href}"${href === here ? ' aria-current="page"' : ''}>${esc(t)}</a>`).join('');
+    const sample = '<span class="tag">sample</span>';
+    const pageHead = (kicker, title, lead) => `<section class="page-hero"><div class="wrap"><p class="eyebrow">${kicker}</p><h1 id="h1">${title}</h1>${lead ? `<p class="hero-sub">${lead}</p>` : ''}</div>${ART.ridge()}</section>`;
+    const ctaBand = (pre) => `<section class="cta-band"><div class="wrap cta-inner" data-reveal><div><h2>${esc(T.cta)}</h2><p>${phone ? `Call <a href="${esc(telHref(phone))}">${esc(phone)}</a>, or send` : 'Send'} a message and get a reply fast.</p></div><a class="btn btn-main" href="${pre}contact.html">${esc(contactName)}${icon('arrow')}</a></div></section>`;
+    const card = (s, pre, i) => `<li data-reveal${s.photo ? ' class="svc-photo"' : ''}><a class="card-link" href="${pre}services/${s.slug}.html">${s.photo ? `<figure>${img(s.photo, i + 1, { sizes: '(min-width: 760px) 30vw, 100vw', lazy: true }).replace(/ alt="[^"]*"/, ' alt=""')}</figure>` : `<span class="num" aria-hidden="true">${String(i + 1).padStart(2, '0')}</span>`}<h3>${esc(s.name)}</h3><span class="more">Learn more${icon('arrow')}</span></a></li>`;
+    const serviceCards = (pre) => real.length ? real.map((s, i) => card(s, pre, i)).join('') : services;
+    const footerHtml = html.slice(html.indexOf('<footer class="foot">'), html.indexOf('</footer>') + 9);
+    const contactSections = html.slice(html.indexOf('<section id="book"'), html.indexOf('</main>'));
+    const aboutWords = more.about || description;
+    const aboutFrom = more.about ? 'In their words, from their website' : description ? (descriptionFrom === 'google' ? `Summary from ${googleMark}` : descriptionFrom === 'lookup' ? 'From a look at their website and listings' : `In their words, from ${esc(siteHost)}`) : '';
+    const v = nameHash >>> 2;
+    const variantClass = `r-${['soft', 'sharp', 'round'][v % 3]} hdr-${(v >> 2) % 2 ? 'brand' : 'light'} cards-${(v >> 3) % 2 ? 'line' : 'lift'}`;
+    const page = (title, main, here, pre = '') => html
+      .replace(/<html lang="en" class="[^"]*">/, `<html lang="en" class="${logoClass} ${variantClass}">`)
+      .replace(/<title>[\s\S]*?<\/title>/, `<title>${esc(title)} · ${esc(name)} (preview by Bookcliff Web)</title>`)
+      .replace(/<link rel="icon" href="logo\.png">/, `<link rel="icon" href="${pre}logo.png">`)
+      .replace(/<style>[\s\S]*?<\/style>/, `<link rel="stylesheet" href="${pre}css/style.css">`)
+      .replace(/<a class="brand" href="#top">([\s\S]*?)<\/a>\n<nav class="main" aria-label="Main">[\s\S]*?<\/nav>/, (m, brand) =>
+        `<a class="brand" href="${pre}index.html">${brand.replace('src="logo.png"', `src="${pre}logo.png"`)}</a>\n<nav class="main" aria-label="Main">${navFor(pre, here)}</nav>`)
+      .replace('</div></header>', `</div><nav class="mnav" aria-label="Pages">${navFor(pre, here)}</nav></header>`)
+      .replace(/<main id="main">[\s\S]*<\/main>/, () => `<main id="main">\n${main}\n</main>`)
+      .replace(/<footer class="foot">[\s\S]*?<\/footer>/, () => footerHtml);
+    const home = `${heroHtml.replace(/href="#contact"/g, 'href="contact.html"')}
+${trustHtml}
+<section class="sec" aria-labelledby="services-h"><div class="wrap">
+<div class="sec-head" data-reveal>${real.length ? `<p class="kicker">Services</p><h2 id="services-h">${esc(T.headline(name, town))}</h2><p class="lead">What ${esc(name)} offers, from their own website.</p>`
+  : `<p class="kicker">Services ${sample}</p><h2 id="services-h">${esc(T.headline(name, town))}</h2><p class="lead">Typical ${esc(T.noun)} services. On the real site, these are ${esc(name)}'s own.</p>`}</div>
+<ul class="svc">${serviceCards('')}</ul>${real.length ? '' : '<p class="fine"><a href="services.html">All services</a></p>'}</div></section>
+<section class="sec sec-tint" aria-labelledby="about-h"><div class="wrap about${aboutPhoto ? ' has-photo' : ' has-art'}">
+<div data-reveal><p class="kicker">About</p><h2 id="about-h">About ${esc(name)}</h2>${aboutWords ? `<p class="about-text">${esc(aboutWords.split(/(?<=[.!?])\s+/).slice(0, 2).join(' '))}</p>` : `<p class="about-text">The story of ${esc(name)} goes here: how it started and who does the work. ${sample}</p>`}<p><a class="btn btn-ghost" href="about.html">More about us${icon('arrow')}</a></p></div>
+${aboutPhoto ? `<figure class="about-photo" data-photo data-reveal>${img(aboutPhoto, 1, { sizes: '(min-width: 760px) 45vw, 100vw', lazy: true })}</figure>` : `<div class="about-art">${ART.aboutArt(scene)}</div>`}
+</div></section>
+${hasGallery ? `<section class="sec" aria-labelledby="photos-h"><div class="wrap"><div class="sec-head" data-reveal><p class="kicker">${esc(galleryName)}</p><h2 id="photos-h">A look at ${esc(name)}</h2></div>
+<ul class="gallery">${allPhotos.slice(0, 3).map((p, i) => fig(p, i, '(min-width: 760px) 34vw, 50vw')).join('')}</ul><p class="fine"><a href="gallery.html">See all ${esc(galleryName.toLowerCase())}</a></p></div></section>` : ''}
+${ctaBand('')}`;
+    pages = { 'index.html': page('Home', home, 'index.html') };
+    pages['services.html'] = page('Services', `${pageHead('Services', esc(T.headline(name, town)), real.length ? `What ${esc(name)} offers, from their own website.` : `Typical ${esc(T.noun)} services ${sample}`)}
+<section class="sec"><div class="wrap">${KIND === 'food' && more.menuUrl ? `<p data-reveal><a class="btn btn-main" href="${esc(more.menuUrl)}" rel="noopener">See their current menu${icon('arrow')}</a></p>` : ''}<ul class="svc">${serviceCards('')}</ul></div></section>
+${ctaBand('')}`, 'services.html');
+    for (const s of real) {
+      const others = real.filter((o) => o !== s).map((o) => `<li><a href="${o.slug}.html">${esc(o.name)}</a></li>`).join('');
+      pages[`services/${s.slug}.html`] = page(s.name, `${pageHead(`Services · ${esc(town)}`, esc(s.name), '')}
+<section class="sec"><div class="wrap svc-detail${s.photo ? ' has-photo' : ''}">
+<div data-reveal>${s.text ? `<p class="about-text">${esc(s.text)}</p><p class="src">In their words, from their website</p>` : `<p class="about-text">${esc(s.name)} from ${esc(name)} in ${esc(town)}, Colorado. On the real site, this page explains how they handle it, in their own words. ${sample}</p>`}
+<p><a class="btn btn-main" href="../contact.html">${esc(contactName)}${icon('arrow')}</a></p>${others ? `<h2 class="small-h">Other services</h2><ul class="links">${others}</ul>` : ''}</div>
+${s.photo ? `<figure class="split-photo" data-photo data-reveal>${img(s.photo, 1, { sizes: '(min-width: 900px) 46vw, 100vw', lazy: false }).replace(/ alt="[^"]*"/, ` alt="${esc(s.name)}"`)}</figure>` : ''}
+</div></section>
+${ctaBand('../')}`, 'services.html', '../');
+    }
+    if (KIND === 'build') {
+      const towns = ['Grand Junction', 'Fruita', 'Palisade', 'Clifton', 'Orchard Mesa', 'Redlands', 'Whitewater', 'Loma', 'Mack'];
+      pages['service-area.html'] = page('Service area', `${pageHead('Service area', `Serving ${esc(town)} and the Grand Valley`, `Typical service area ${sample} On the real site, these are the towns ${esc(name)} covers.`)}
+<section class="sec"><div class="wrap"><ul class="towns">${[town, ...towns.filter((t) => t !== town)].map((t) => `<li data-reveal>${icon('pin')}${esc(t)}</li>`).join('')}</ul></div></section>
+${ctaBand('')}`, 'service-area.html');
+    }
+    if (hasGallery) {
+      pages['gallery.html'] = page(galleryName, `${pageHead(esc(galleryName), `A look at ${esc(name)}`, `Photos from ${esc(name)}'s own website.`)}
+<section class="sec"><div class="wrap"><ul class="gallery">${allPhotos.map((p, i) => fig(p, i, '(min-width: 760px) 34vw, 50vw')).join('')}</ul></div></section>
+${ctaBand('')}`, 'gallery.html');
+    }
+    pages['about.html'] = page('About', `${pageHead('About', `About ${esc(name)}`, '')}
+<section class="sec"><div class="wrap about${aboutPhoto ? ' has-photo' : ' has-art'}">
+<div data-reveal>${aboutWords ? `<p class="about-text">${esc(aboutWords)}</p><p class="src">${aboutFrom}</p>` : `<p class="about-text">This is where ${esc(name)}'s story goes: how it started, who does the work and what makes it different. ${sample}</p>`}${socialHtml ? `<div class="socials">${socialHtml}</div>` : ''}</div>
+${aboutPhoto ? `<figure class="about-photo" data-photo data-reveal>${img(aboutPhoto, 1, { sizes: '(min-width: 760px) 45vw, 100vw', lazy: false })}</figure>` : `<div class="about-art">${ART.aboutArt(scene)}</div>`}
+</div></section>
+${hoursHtml}
+${ctaBand('')}`, 'about.html');
+    pages['contact.html'] = page(contactName, `${pageHead(esc(contactName), esc(T.cta), 'Send a message and get a personal reply by email within a minute, any time of day.')}
+${KIND === 'book' ? contactSections : contactSections.replace(/<section id="book"[\s\S]*?<\/section>\n?/, (m) => '').concat(contactSections.match(/<section id="book"[\s\S]*?<\/section>/)?.[0] || '')}`, 'contact.html');
+  }
+
   fs.mkdirSync(path.join(outDir, slug), { recursive: true });
-  fs.writeFileSync(path.join(outDir, slug, 'index.html'), html);
+  if (pages) {
+    fs.mkdirSync(path.join(outDir, slug, 'css'), { recursive: true });
+    fs.writeFileSync(path.join(outDir, slug, 'css', 'style.css'), css.trim() + '\n');
+    for (const [file, body] of Object.entries(pages)) {
+      fs.mkdirSync(path.dirname(path.join(outDir, slug, file)), { recursive: true });
+      fs.writeFileSync(path.join(outDir, slug, file), body);
+    }
+  } else {
+    fs.writeFileSync(path.join(outDir, slug, 'index.html'), html);
+  }
   if (sp.length) {
     fs.mkdirSync(path.join(outDir, slug, 'img'), { recursive: true });
     for (const file of sp.flatMap((p) => p.files)) fs.copyFileSync(file, path.join(outDir, slug, 'img', path.basename(file)));
