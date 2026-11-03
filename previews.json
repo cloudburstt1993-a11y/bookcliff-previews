@@ -131,5 +131,14 @@
     "town": "Grand Junction",
     "built": "2026-11-03",
     "expires": "2026-11-17"
+  },
+  {
+    "slug": "advanced-pest-solutions-86aa91",
+    "business": "Advanced Pest Solutions",
+    "trade": "general",
+    "town": "Grand Junction",
+    "built": "2026-11-03",
+    "expires": "2026-11-17",
+    "request": "6c81a7ac-8ba3-4a2c-a687-555655829cb7"
   }
 ]
